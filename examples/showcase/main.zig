@@ -541,6 +541,26 @@ fn navPanel(st: *AppState) zigui.View {
     }).spacing(16).frameMaxHeight();
 }
 
+fn geometryPanel(st: *AppState) zigui.View {
+    return zigui.VStack(.{
+        header("Geometry"),
+        card("GeometryReader: content built for the size it is given", zigui.GeometryReader(AppState, st, geometryContent)
+            .frameMaxWidth()
+            .frameHeight(96)),
+    }).spacing(16);
+}
+
+/// The `GeometryReader` demo's content: its own size, and bars a quarter and
+/// half as wide as it is (resize the window to watch them follow).
+fn geometryContent(_: *const AppState, size: zigui.Size) zigui.View {
+    const label = std.fmt.allocPrint(zigui.buildAlloc(), "{d:.0} × {d:.0} pt", .{ size.width, size.height }) catch "";
+    return zigui.VStack(.{
+        zigui.Text(label).font(.headline),
+        zigui.RoundedRectangle(t().colors.accent, 6).frame(size.width / 4, 20),
+        zigui.RoundedRectangle(t().colors.accent.withAlpha(0.5), 6).frame(size.width / 2, 20),
+    }).spacing(8).alignment(.leading).frameMaxWidth().frameAlign(.leading);
+}
+
 const chat_items = [_]zigui.SidebarItem{
     .{ .label = "New Chat", .detail = "just now" },
     .{ .label = "what does this app do", .detail = "4h ago" },
@@ -559,6 +579,7 @@ const sidebar_items = [_]zigui.SidebarItem{
     .{ .label = "Overlays", .icon = .menu },
     .{ .label = "Effects", .icon = .zap },
     .{ .label = "Navigation", .icon = .send },
+    .{ .label = "Geometry", .icon = .ruler },
 };
 
 fn detailPanel(st: *AppState) zigui.View {
@@ -571,6 +592,7 @@ fn detailPanel(st: *AppState) zigui.View {
         6 => overlaysPanel(st),
         7 => effectsPanel(st),
         8 => return navPanel(st).padding(20),
+        9 => geometryPanel(st),
         else => controlsPanel(st),
     };
     // Every long panel scrolls as a whole so nothing is clipped off-screen.

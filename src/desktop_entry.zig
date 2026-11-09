@@ -1,7 +1,7 @@
 //! Values for a freedesktop desktop entry (`.desktop` file), escaped per the
 //! Desktop Entry Specification, so a path with spaces, quotes, `$`, `%` or
 //! backslashes in it means what it says. Pure; `app.zig`'s
-//! `installDesktopEntry` writes with it.
+//! `installDesktopEntry` and `desktopEntryState` write and read with it.
 
 const std = @import("std");
 

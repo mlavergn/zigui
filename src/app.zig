@@ -68,6 +68,10 @@ pub const Config = struct {
     /// macOS menu bar menus, after the application menu (ignored elsewhere:
     /// there is no menu bar to put them in).
     menus: []const Menu = &.{},
+    /// macOS: a "Settings… ⌘," entry in the application menu (after About)
+    /// that runs this on the UI thread. Elsewhere there is no application
+    /// menu, so an app offers its settings in its own window too.
+    settings: ?zigui.Callback = null,
     /// A face behind the bundled emoji font for codepoints no bundled face has
     /// (a system CJK font, `zigui.Font.fromExternal`). Must outlive `run`.
     fallback_font: ?*const zigui.ttf.Font = null,
@@ -402,6 +406,14 @@ pub fn colorScheme() zigui.ColorScheme {
 var g_key_fn: ?*const fn (key: u32, mods: u16) bool = null;
 pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
     g_key_fn = f;
+}
+
+/// An optional handler for the main window gaining (true) or losing (false)
+/// keyboard focus — an app re-reads state that may have changed while another
+/// app was in front.
+var g_focus_fn: ?*const fn (gained: bool) void = null;
+pub fn setFocusHandler(f: ?*const fn (gained: bool) void) void {
+    g_focus_fn = f;
 }
 
 /// An optional handler for typed text (after IME composition), called before
@@ -786,6 +798,82 @@ pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
     return true;
 }
 
+/// Where the running executable's freedesktop entry stands (see
+/// `installDesktopEntry`).
+pub const DesktopEntryState = enum {
+    /// No entry of its own, and none installed system-wide.
+    missing,
+    /// Its entry runs this executable.
+    current,
+    /// Its entry runs another path (the executable moved).
+    stale,
+    /// A package installed one under `/usr/share` or `/usr/local/share`.
+    system,
+    /// Not Linux.
+    unsupported,
+};
+
+/// The per-user entry's path for the running executable, and its app ID.
+const EntryPaths = struct { desktop: [:0]const u8, icon: [:0]const u8, id: []const u8, exe: []const u8 };
+
+fn entryPaths(exe_buf: *[4096]u8, data_buf: *[4096]u8, desk_buf: *[4096]u8, icon_buf: *[4096]u8) ?EntryPaths {
+    const n = std.c.readlink("/proc/self/exe", exe_buf, exe_buf.len);
+    if (n <= 0) return null;
+    const exe = exe_buf[0..@intCast(n)];
+    const id = exe[(std.mem.lastIndexOfScalar(u8, exe, '/') orelse return null) + 1 ..];
+    const data_dir: []const u8 = if (c.SDL_getenv("XDG_DATA_HOME")) |x|
+        std.mem.span(x)
+    else if (c.SDL_getenv("HOME")) |h|
+        std.fmt.bufPrint(data_buf, "{s}/.local/share", .{std.mem.span(h)}) catch return null
+    else
+        return null;
+    const desktop = std.fmt.bufPrintSentinel(desk_buf, "{s}/applications/{s}.desktop", .{ data_dir, id }, 0) catch return null;
+    const icon = std.fmt.bufPrintSentinel(icon_buf, "{s}/icons/hicolor/256x256/apps/{s}.png", .{ data_dir, id }, 0) catch return null;
+    return .{ .desktop = desktop, .icon = icon, .id = id, .exe = exe };
+}
+
+/// Reports whether the running executable has a desktop entry, and whether it
+/// still points here. Linux only.
+pub fn desktopEntryState() DesktopEntryState {
+    if (builtin.os.tag != .linux) return .unsupported;
+    var exe_buf: [4096]u8 = undefined;
+    var data_buf: [4096]u8 = undefined;
+    var desk_buf: [4096]u8 = undefined;
+    var icon_buf: [4096]u8 = undefined;
+    const paths = entryPaths(&exe_buf, &data_buf, &desk_buf, &icon_buf) orelse return .missing;
+    for ([_][]const u8{ "/usr/share/applications", "/usr/local/share/applications" }) |dir| {
+        var sys_buf: [4096]u8 = undefined;
+        const sys = std.fmt.bufPrintSentinel(&sys_buf, "{s}/{s}.desktop", .{ dir, paths.id }, 0) catch continue;
+        if (c.SDL_GetPathInfo(sys.ptr, null)) return .system;
+    }
+    var size: usize = 0;
+    const data = c.SDL_LoadFile(paths.desktop.ptr, &size) orelse return .missing;
+    defer c.SDL_free(data);
+    const text = @as([*]const u8, @ptrCast(data))[0..size];
+    // The Exec line `installDesktopEntry` writes for this path, escaped alike.
+    var want_buf: [4 * 4096 + 16]u8 = undefined;
+    @memcpy(want_buf[0..5], "Exec=");
+    const exec = zigui.desktop_entry.execValue(want_buf[5..], paths.exe, false) orelse return .stale;
+    return if (std.mem.find(u8, text, want_buf[0 .. 5 + exec.len]) != null) .current else .stale;
+}
+
+/// Removes the running executable's per-user desktop entry and its icon.
+/// Linux only; returns false elsewhere or when the entry could not be removed
+/// (logged). A missing entry counts as removed.
+pub fn removeDesktopEntry() bool {
+    if (builtin.os.tag != .linux) return false;
+    var exe_buf: [4096]u8 = undefined;
+    var data_buf: [4096]u8 = undefined;
+    var desk_buf: [4096]u8 = undefined;
+    var icon_buf: [4096]u8 = undefined;
+    const paths = entryPaths(&exe_buf, &data_buf, &desk_buf, &icon_buf) orelse return false;
+    for ([_][:0]const u8{ paths.desktop, paths.icon }) |path| {
+        if (!c.SDL_GetPathInfo(path.ptr, null)) continue;
+        if (!c.SDL_RemovePath(path.ptr)) return logInstallError(path);
+    }
+    return true;
+}
+
 /// Logs why `value` cannot go in a desktop entry. The value itself is left
 /// out: a control character in it would be written to the log raw.
 fn logUnwritable(what: []const u8, value: []const u8) bool {
@@ -1048,7 +1136,7 @@ pub fn run(
     if (cfg.min_width > 0 and cfg.min_height > 0)
         _ = c.SDL_SetWindowMinimumSize(window, @intCast(cfg.min_width), @intCast(cfg.min_height));
     if (cfg.unified_titlebar and builtin.os.tag == .macos) cocoa.unifyTitlebar(window);
-    if (cfg.menus.len > 0 and builtin.os.tag == .macos) cocoa.setMenuBar(cfg.menus);
+    if ((cfg.menus.len > 0 or cfg.settings != null) and builtin.os.tag == .macos) cocoa.setMenuBar(cfg.menus, cfg.settings);
     if (cfg.drag_band > 0) {
         g_drag_band = cfg.drag_band;
         _ = c.SDL_SetWindowHitTest(window, bandHitTest, null);
@@ -1670,8 +1758,9 @@ const cocoa = struct {
         const Fn = switch (args.len) {
             0 => fn (Id, Id) callconv(.c) R,
             1 => fn (Id, Id, @TypeOf(args[0])) callconv(.c) R,
+            2 => fn (Id, Id, @TypeOf(args[0]), @TypeOf(args[1])) callconv(.c) R,
             3 => fn (Id, Id, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2])) callconv(.c) R,
-            else => @compileError("zero, one or three arguments"),
+            else => @compileError("zero to three arguments"),
         };
         const f: *const Fn = @ptrCast(&objc_msgSend);
         return @call(.auto, f, .{ target, sel_registerName(sel) } ++ args);
@@ -1863,12 +1952,25 @@ const cocoa = struct {
         status_cb = null;
     }
 
-    /// Keep SDL's application menu (About / Hide / Quit) and replace the rest.
-    fn setMenuBar(menus: []const Menu) void {
+    /// Keep SDL's application menu (About / Hide / Quit) and replace the rest;
+    /// `settings` adds "Settings… ⌘," to the application menu, after About.
+    fn setMenuBar(menus: []const Menu, settings: ?zigui.Callback) void {
         const ns_app = send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
         const bar = send(Id, ns_app, "mainMenu", .{}) orelse return;
         while (send(i64, bar, "numberOfItems", .{}) > 1) send(void, bar, "removeItemAtIndex:", .{@as(i64, 1)});
         const tgt = menuTarget();
+        if (settings) |cb| settings: {
+            const app_item = send(Id, bar, "itemAtIndex:", .{@as(i64, 0)}) orelse break :settings;
+            const app_menu = send(Id, app_item, "submenu", .{}) orelse break :settings;
+            const item = send(Id, send(Id, objc_getClass("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{ nsString("Settings…"), sel_registerName("fire:"), nsString(",") });
+            send(void, item, "setTag:", .{@as(i64, @intCast(actions.items.len))});
+            actions.append(std.heap.page_allocator, cb) catch break :settings;
+            send(void, item, "setTarget:", .{tgt});
+            // After "About <app>" and a separator, as macOS apps place it.
+            const at: i64 = @min(1, send(i64, app_menu, "numberOfItems", .{}));
+            send(void, app_menu, "insertItem:atIndex:", .{ send(Id, objc_getClass("NSMenuItem"), "separatorItem", .{}), at });
+            send(void, app_menu, "insertItem:atIndex:", .{ item, at + 1 });
+        }
         for (menus) |m| {
             const holder = send(Id, objc_getClass("NSMenuItem"), "new", .{});
             const sub = send(Id, send(Id, objc_getClass("NSMenu"), "alloc", .{}), "initWithTitle:", .{nsString(m.title)});
@@ -2090,7 +2192,8 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
     switch (ev.type) {
         c.SDL_EVENT_QUIT => running.* = false,
         // Clicking anywhere else dismisses the popover, like a native panel.
-        c.SDL_EVENT_WINDOW_FOCUS_LOST => if (on_panel) hidePanel(),
+        c.SDL_EVENT_WINDOW_FOCUS_LOST => if (on_panel) hidePanel() else if (g_focus_fn) |f| f(false),
+        c.SDL_EVENT_WINDOW_FOCUS_GAINED => if (ev.window.windowID != g_panel_id) if (g_focus_fn) |f| f(true),
         // The close button: hide-to-tray when configured, else quit. (⌘Q still
         // sends SDL_EVENT_QUIT.)
         c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => if (on_panel) hidePanel() else if (g_hide_on_close) hideWindow() else {

@@ -239,6 +239,8 @@ pub const Modifiers = struct {
     opacity: f32 = 1,
     on_tap: ?Callback = null,
     on_drag: ?DragCallback = null,
+    /// Content is clipped to the view's frame (see `View.clipped`).
+    clipped: bool = false,
     /// Right-click (see `View.onSecondaryTap`).
     on_secondary: ?Callback = null,
     /// A background painted only while the cursor is within this view's frame
@@ -382,6 +384,17 @@ pub const ScrollState = struct {
     pub fn scrollToBottom(self: *ScrollState) void {
         self.offset = self.maxOffset();
     }
+    /// Scroll just enough that row `index` of a list of `row_h`-tall rows is
+    /// in view (keyboard selection follows the cursor). Before the first paint
+    /// (no viewport yet) it only brings a row above the top back into view.
+    pub fn reveal(self: *ScrollState, index: usize, row_h: f32) void {
+        const top = @as(f32, @floatFromInt(index)) * row_h;
+        if (top < self.offset) {
+            self.offset = top;
+        } else if (self.viewport_h > 0 and top + row_h > self.offset + self.viewport_h) {
+            self.offset = top + row_h - self.viewport_h;
+        }
+    }
     /// True when scrolled to (or past) the bottom — used to decide whether to
     /// keep a streaming transcript pinned.
     pub fn atBottom(self: *const ScrollState) bool {
@@ -399,6 +412,12 @@ pub const TextFieldData = struct { state: *TextFieldState, placeholder: []const 
 /// selection) with vertical scroll in an app-owned `ScrollState`.
 pub const TextEditorData = struct { state: *TextFieldState, scroll: *ScrollState, line_numbers: bool = true };
 pub const ScrollStateData = struct { state: *ScrollState, content: *const View };
+
+/// A `GeometryReader`'s content builder and its context (see `GeometryReader`).
+pub const GeometryData = struct {
+    ctx: *const anyopaque,
+    build: *const fn (ctx: *const anyopaque, size: Size) View,
+};
 pub const PickerData = struct { selection: Binding(i64), options: []const []const u8 };
 
 pub const Kind = union(enum) {
@@ -430,6 +449,9 @@ pub const Kind = union(enum) {
     /// (so it can be wheel-driven and auto-followed), unlike `scroll`'s static
     /// offset.
     scroll_state: ScrollStateData,
+    /// Content built from the size it is laid out at (see `GeometryReader`);
+    /// fills the space it is offered.
+    geometry: GeometryData,
     textfield: TextFieldData,
     /// A multi-line editor (see `TextEditorData`). Reuses `TextFieldState`, so it
     /// shares the focus/keyboard plumbing with `textfield`.
@@ -721,6 +743,13 @@ pub const View = struct {
         v.mods.on_drag = cb;
         return v;
     }
+    /// Clip the content to this view's frame (rounded by its `cornerRadius`),
+    /// like SwiftUI's `.clipped()`: nothing inside paints past the frame.
+    pub fn clipped(self: View) View {
+        var v = self;
+        v.mods.clipped = true;
+        return v;
+    }
     /// Paint `color` behind this view only while the cursor hovers it (honoring
     /// the view's `corner_radius`). Pair with `onTap` for menu/list rows.
     pub fn hoverFill(self: View, color: Color) View {
@@ -948,6 +977,8 @@ pub const BuildTokens = struct {
     row_stripe: Color = Color.black.withAlpha(0.03),
 };
 threadlocal var build_tokens: BuildTokens = .{};
+/// The theme `setThemeTokens` last published (see `buildTheme`).
+threadlocal var build_theme: Theme = @import("../theme/macos.zig").light;
 
 /// Publish the active theme's build-time tokens for composed constructors. Call
 /// once per frame (the app does this in its build step) before building views.
@@ -961,6 +992,7 @@ pub fn setThemeTokens(t: Theme) void {
         .hover = t.colors.hover,
         .row_stripe = if (t.scheme == .dark) Color.white.withAlpha(0.04) else Color.black.withAlpha(0.03),
     };
+    build_theme = t;
 }
 
 /// Set the arena used by view constructors for the duration of building a view
@@ -980,6 +1012,13 @@ pub fn buildAlloc() Allocator {
 /// The active build-time theme tokens, for composed (theme-less) constructors.
 pub fn buildTokens() BuildTokens {
     return build_tokens;
+}
+
+/// The whole theme `setThemeTokens` last published, for composed constructors
+/// outside zigui that need colors `BuildTokens` does not carry. Before any
+/// `setThemeTokens` it is the macOS light theme, as `BuildTokens`' defaults are.
+pub fn buildTheme() Theme {
+    return build_theme;
 }
 
 pub fn Text(s: []const u8) View {
@@ -1181,6 +1220,22 @@ pub fn ScrollViewState(scroll_state: *ScrollState, content: View) View {
     const child = buildAlloc().create(View) catch @panic("oom");
     child.* = content;
     return .{ .kind = .{ .scroll_state = .{ .state = scroll_state, .content = child } } };
+}
+
+/// A view whose content depends on its own size, like SwiftUI's
+/// `GeometryReader`: `f(ctx, size)` builds the content once layout knows the
+/// size the reader is given, and the content is laid out in that rect. Fills
+/// the space it is offered, so give it a frame or a flexible parent.
+///
+/// The content is built at paint time, in the frame arena, so `f` may call any
+/// view constructor (and `buildAlloc`/`buildTokens`) as a body does. `ctx`
+/// must outlive the frame (the build arena does).
+pub fn GeometryReader(comptime T: type, ctx: *const T, comptime f: fn (*const T, Size) View) View {
+    return .{ .kind = .{ .geometry = .{ .ctx = ctx, .build = struct {
+        fn g(p: *const anyopaque, size: Size) View {
+            return f(@ptrCast(@alignCast(p)), size);
+        }
+    }.g } } };
 }
 
 // List, LazyVGrid/LazyHGrid, TabView, Sidebar/RadioGroup/Table moved to
@@ -1723,7 +1778,7 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
                 .height = @max(lh, label_icon),
             }) };
         },
-        .scroll, .scroll_state => return .{ .leaf = .{
+        .scroll, .scroll_state, .geometry => return .{ .leaf = .{
             .min = .{},
             .ideal = .{ .width = 200, .height = 200 },
             .max = .{ .width = inf, .height = inf },
@@ -2088,7 +2143,14 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
         try ctx.hit_regions.append(ctx.arena, .{ .rect = outer, .action = .{ .drag = dcb }, .disabled = child_ctx.disabled });
     }
 
+    // `.clipped()`: content (not the background or border) is cut to the
+    // frame, and anything wholly outside it skips painting.
+    if (v.mods.clipped) {
+        try canvas.pushClip(outer, v.mods.corner_radius);
+        child_ctx.visible = if (ctx.visible) |vis| (vis.intersection(outer) orelse Rect{}) else outer;
+    }
     try paintContent(&child_ctx, v, clr, canvas);
+    if (v.mods.clipped) try canvas.popClip();
 
     // Border (in front of content).
     if (v.mods.border_color) |bc| {
@@ -2184,6 +2246,7 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
         },
         .scroll => |sd| try paintScroll(ctx, sd, rect, canvas),
         .scroll_state => |sd| try paintScrollState(ctx, sd, rect, canvas),
+        .geometry => |gd| try paintGeometry(ctx, gd, rect, canvas),
         .textfield => |tf| {
             try paintTextField(ctx, v, tf, rect, canvas);
             const val = ctx.arena.dupe(u8, tf.state.text()) catch "";
@@ -2876,6 +2939,18 @@ fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas
         .disabled = false,
     });
     try paintScrollbar(ctx, sd.state, rect, canvas);
+}
+
+/// Build a `GeometryReader`'s content for `rect`'s size, then lay it out and
+/// paint it there. Building needs an arena after the frame's build has ended,
+/// so the frame arena stands in for the build arena while the content builds.
+fn paintGeometry(ctx: *const Context, gd: GeometryData, rect: Rect, canvas: *Canvas) Allocator.Error!void {
+    const saved = current_arena;
+    current_arena = ctx.arena;
+    defer current_arena = saved;
+    const content = gd.build(gd.ctx, rect.size());
+    const node = try buildNode(ctx, content);
+    try paint(ctx, content, try engine.arrange(ctx.arena, node, rect), canvas);
 }
 
 /// Draw a slim, rounded scroll indicator on the right edge of `rect` when the
@@ -5506,4 +5581,62 @@ test "painter: every family paints all controls without error" {
         try p.panel(s, r, 8, .popover);
         try testing.expect(canvas.commands.items.len > 0);
     }
+}
+
+test "view: GeometryReader builds its content for the size it is laid out at" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const Probe = struct {
+        seen: Size = .{},
+        fn body(self: *const @This(), size: Size) View {
+            @constCast(self).seen = size;
+            // Red on the left half, blue on the right: the halves follow the size.
+            return HStack(.{
+                Rectangle(Color.red).frame(size.width / 2, size.height),
+                Rectangle(Color.blue).frame(size.width / 2, size.height),
+            }).spacing(0);
+        }
+    };
+    var probe: Probe = .{};
+    const v = GeometryReader(Probe, &probe, Probe.body);
+    var fb = try renderToFb(&env, &c, v, .{ .x = 0, .y = 0, .width = 100, .height = 40 }, 100, 40);
+    defer fb.deinit();
+    try testing.expectEqual(@as(f32, 100), probe.seen.width);
+    try testing.expectEqual(@as(f32, 40), probe.seen.height);
+    try testing.expect(fb.at(30, 20).r > fb.at(30, 20).b);
+    try testing.expect(fb.at(70, 20).b > fb.at(70, 20).r);
+}
+
+test "view: clipped keeps content inside the frame" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    // A 100-wide red bar in a 40-wide clipped frame paints only the frame.
+    const v = HStack(.{
+        Rectangle(Color.red).frame(100, 20).frame(40, 20).clipped(),
+        Spacer(),
+    }).spacing(0).frameMaxWidth().frameAlign(.leading);
+    var fb = try renderToFb(&env, &c, v, .{ .x = 0, .y = 0, .width = 100, .height = 20 }, 100, 20);
+    defer fb.deinit();
+    try testing.expect(fb.at(20, 10).r > 0.9 and fb.at(20, 10).g < 0.2);
+    try testing.expect(fb.at(70, 10).g > 0.9);
+}
+
+test "view: buildTheme returns the theme setThemeTokens published" {
+    const dark = @import("../theme/macos.zig").dark;
+    setThemeTokens(dark);
+    defer setThemeTokens(@import("../theme/macos.zig").light);
+    try testing.expect(buildTheme().scheme == .dark);
+    try testing.expect(buildTheme().colors.label.r == dark.colors.label.r);
+}
+
+test "view: ScrollState.reveal follows a cursor row" {
+    var scroll: ScrollState = .{ .offset = 0, .viewport_h = 100, .content_h = 2000 };
+    scroll.reveal(9, 20);
+    try testing.expectEqual(@as(f32, 100), scroll.offset);
+    scroll.reveal(2, 20);
+    try testing.expectEqual(@as(f32, 40), scroll.offset);
 }

@@ -603,6 +603,20 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
 - app.zig on macOS: unified titlebar + drag band, a native menu bar
   (`Config.menus`), template tray icons — via the Objective-C runtime (`objc`).
 
+### `GeometryReader`, `.clipped()` and `buildTheme` (for composed controls outside zigui)
+- `GeometryReader(T, ctx, f)` — content built from the size it is laid out at,
+  like SwiftUI's. `f(ctx, size)` runs at paint time with the frame arena standing
+  in for the build arena (`paintGeometry`), so it may call any constructor; the
+  content is then laid out in the reader's rect. Fills what it is offered. Shown
+  in the showcase's Geometry panel (`showcase --screenshot out.bmp 9`).
+- `.clipped()` — cuts a view's content to its frame (rounded by its
+  `cornerRadius`), like SwiftUI's; ziggui's split views clip each pane with it.
+- `buildTheme()` — the whole `Theme` `setThemeTokens` last published, for
+  composed constructors outside zigui (ziggui derives its extra tokens from it).
+- zigui is consumed only by `../ziggui`, which re-exports it beside its own
+  widgets (the chat pieces, `VirtualList`/`DiffView`/table rows, and the split views as `HSplitView`/`VSplitView`
+  moved there). Apps depend on ziggui, never on zigui directly.
+
 ## Coding conventions
 - Readability over cleverness (it's an open-source teaching codebase). Match the
   surrounding comment density and naming. Avoid heavy comptime.
