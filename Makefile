@@ -9,9 +9,19 @@
 # Optional include to extend the makefile targets
 -include ../styleguide/Makefile.in
 
+# Without that include (a fresh clone), `format` and `validate` are defined
+# here, so `make` still works: no lint step, which the include brings.
+ifeq ($(wildcard ../styleguide/Makefile.in),)
+format:
+	zig fmt build.zig build.zig.zon src examples
+
+validate: clean format build test
+	@echo "validate done"
+endif
+
 .DEFAULT_GOAL := all
 
-.PHONY: build dist run demo edit test docs clean windows linux linux-arm64 macos-arm64 cross
+.PHONY: all build dist run demo edit test docs clean format validate tag windows linux linux-arm64 macos-arm64 cross
 
 # ---------------------------------------------
 # Configuration

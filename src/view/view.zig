@@ -97,6 +97,17 @@ pub const DragCallback = struct {
     func: *const fn (?*anyopaque, dx: f32, dy: f32) void,
 };
 
+/// Called with `true` when the pointer enters a view's frame and `false` when
+/// it leaves (see `View.onHover`).
+pub const HoverCallback = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (?*anyopaque, inside: bool) void,
+
+    pub fn call(self: HoverCallback, inside: bool) void {
+        self.func(self.ctx, inside);
+    }
+};
+
 pub const Callback = struct {
     ctx: ?*anyopaque = null,
     func: *const fn (?*anyopaque) void,
@@ -247,6 +258,14 @@ pub const Modifiers = struct {
     /// (see `Context.hover_point`). Gives menu rows / list rows a live hover
     /// highlight without per-widget state.
     hover_fill: ?Color = null,
+    /// Told when the pointer enters or leaves this view's frame (see `View.onHover`).
+    on_hover: ?HoverCallback = null,
+    /// This view's frame stays live while a popover is open: the popover's
+    /// tap-to-dismiss region leaves it out (see `View.popoverPassthrough`).
+    popover_passthrough: bool = false,
+    /// This view's frame stays live while a sheet or alert is open: the
+    /// modal's tap-to-dismiss region leaves it out (see `View.modalPassthrough`).
+    modal_passthrough: bool = false,
     /// Fired when a focused `TextField` is submitted (Enter). Stashed on the
     /// field's `TextFieldState` during paint; see `submitFocused`.
     on_submit: ?Callback = null,
@@ -485,7 +504,7 @@ pub const Pen = struct {
         try self.canvas.fillRoundedRect(r, radius, self.tint(color));
     }
     /// `top` at the rect's top edge fading to `bottom` at its bottom edge.
-    pub fn vGradient(self: *Pen, r: Rect, top: Color, bottom: Color) Allocator.Error!void {
+    pub fn verticalGradient(self: *Pen, r: Rect, top: Color, bottom: Color) Allocator.Error!void {
         try self.canvas.push(.{ .linear_gradient = .{ .rect = r, .start = r.origin(), .end = .{ .x = r.x, .y = r.maxY() }, .c0 = self.tint(top), .c1 = self.tint(bottom) } });
     }
     /// One line of text with its top-left at `origin`.
@@ -755,6 +774,35 @@ pub const View = struct {
     pub fn hoverFill(self: View, color: Color) View {
         var v = self;
         v.mods.hover_fill = color;
+        return v;
+    }
+    /// Call `cb(true)` when the pointer enters this view's frame and `cb(false)`
+    /// when it leaves, like SwiftUI's `.onHover`. It fires on pointer movement
+    /// only (a view appearing under a still pointer is not entered), skips a
+    /// disabled view, and does not see overlays: a popover over this view does
+    /// not count as leaving it.
+    pub fn onHover(self: View, cb: HoverCallback) View {
+        var v = self;
+        v.mods.on_hover = cb;
+        return v;
+    }
+    /// Keep this view's frame live while a popover is open: the popover's
+    /// tap-to-dismiss region leaves it out, so a tap there reaches the view
+    /// (and the popover stays up unless the view closes it). A menu bar's
+    /// titles use it, so a tap on another title switches menus. Sheets and
+    /// alerts are modal and ignore it.
+    pub fn popoverPassthrough(self: View) View {
+        var v = self;
+        v.mods.popover_passthrough = true;
+        return v;
+    }
+    /// Keep this view's frame live while a sheet or alert is open: the
+    /// modal's tap-to-dismiss region leaves it out, so a tap there reaches
+    /// the view (the scrim is still drawn over it). Window buttons in a
+    /// custom title bar use it, so minimize and close work under a dialog.
+    pub fn modalPassthrough(self: View) View {
+        var v = self;
+        v.mods.modal_passthrough = true;
         return v;
     }
     /// Fire `cb` when this (focused) `TextField` is submitted with Enter.
@@ -1339,6 +1387,10 @@ pub const HitAction = union(enum) {
     text_click: TextClick,
     /// Select a specific value (e.g. a picker segment).
     select: struct { binding: Binding(i64), value: i64 },
+    /// An overlay's tap-to-dismiss region: flips the overlay's binding, as
+    /// `toggle` does. Its own variant so the app can tell it from content
+    /// (a custom title bar still drags under it; see `app.bandHitTest`).
+    dismiss: Binding(bool),
     /// Arm a drag-area handler (see `View.onDrag`).
     drag: DragCallback,
     /// A right-click handler; never fires on a primary click (`dispatchTap` skips it).
@@ -1383,6 +1435,10 @@ fn caretIndexAt(tc: TextClick, p: Point) usize {
 }
 
 pub const HitRegion = struct { rect: Rect, action: HitAction, disabled: bool };
+
+/// A view's frame and its `onHover` callback, collected at paint (see
+/// `Context.hover_regions` and `dispatchHover`).
+pub const HoverRegion = struct { rect: Rect, callback: HoverCallback, disabled: bool };
 
 /// An accessibility role, mirroring the platform a11y roles a control maps to.
 /// (`switch_`/`text_field` are spelled with a trailing underscore to avoid the
@@ -1443,6 +1499,16 @@ pub const Context = struct {
     /// `ScrollViewState` registers its viewport so the app can route wheel
     /// events with `dispatchScroll`.
     scroll_regions: ?*std.ArrayList(ScrollRegion) = null,
+    /// Optional sink for `onHover` regions. When set, each view with an
+    /// `onHover` callback registers its frame so the app can route pointer
+    /// motion with `dispatchHover`; when null, `onHover` is ignored.
+    hover_regions: ?*std.ArrayList(HoverRegion) = null,
+    /// Frames of `popoverPassthrough` views, which popover dismiss regions
+    /// leave out. `render` supplies a list when this is null.
+    passthrough: ?*std.ArrayList(Rect) = null,
+    /// Frames of `modalPassthrough` views, which sheet and alert dismiss
+    /// regions leave out. `render` supplies a list when this is null.
+    modal_passthrough: ?*std.ArrayList(Rect) = null,
     /// The on-screen part of the current scroll viewport (null = everything is
     /// visible). Views wholly outside it skip painting; see `paint`.
     visible: ?Rect = null,
@@ -1858,19 +1924,26 @@ pub fn render(ctx: *const Context, v: View, rect: Rect, canvas: *Canvas) !void {
     // Memoize layout measurement for this frame (see `engine.beginMeasureCache`).
     const owns_cache = engine.beginMeasureCache();
     defer if (owns_cache) engine.endMeasureCache();
-    try renderInto(ctx, v, rect, canvas);
-    if (ctx.overlays) |overlays| {
+    // Popover dismiss regions leave out `popoverPassthrough` frames: collect
+    // them here unless the caller already does.
+    var passthrough: std.ArrayList(Rect) = .empty;
+    var modal_passthrough: std.ArrayList(Rect) = .empty;
+    var rctx = ctx.*;
+    if (rctx.passthrough == null) rctx.passthrough = &passthrough;
+    if (rctx.modal_passthrough == null) rctx.modal_passthrough = &modal_passthrough;
+    try renderInto(&rctx, v, rect, canvas);
+    if (rctx.overlays) |overlays| {
         // Index-based loop: overlay content rendered below may enqueue *more*
         // overlays (nesting); appending keeps the list growing and we process
         // each exactly once — no double-drain, no recursion.
         var i: usize = 0;
         while (i < overlays.items.len) : (i += 1) {
             const req = overlays.items[i]; // copy: drawing may reallocate the list
-            try drawOverlay(ctx, req, rect, canvas);
+            try drawOverlay(&rctx, req, rect, canvas);
         }
     }
     // The text-field context menu sits above everything, including app overlays.
-    try drawContextMenu(ctx, rect, canvas);
+    try drawContextMenu(&rctx, rect, canvas);
 }
 
 /// Render `v` for a HiDPI display: lay out and paint in logical *points* (so all
@@ -1948,9 +2021,13 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
         try canvas.fillRect(root, ctx.theme.colors.scrim);
     }
     // 2. Tap-to-dismiss region beneath the content (appended before content's
-    //    own regions, so a tap on the content hits the content first).
+    //    own regions, so a tap on the content hits the content first). A
+    //    popover's leaves out the `popoverPassthrough` frames, a sheet's or
+    //    alert's the `modalPassthrough` ones.
     if (req.dismiss) |d| {
-        try ctx.hit_regions.append(ctx.arena, .{ .rect = root, .action = .{ .toggle = d }, .disabled = false });
+        const list = if (req.style == .popover) ctx.passthrough else ctx.modal_passthrough;
+        const holes: []const Rect = if (list) |l| l.items else &.{};
+        try appendDismiss(ctx, root, holes, d);
     }
 
     // 3. Measure & position the content. macOS sheets are *centered* window
@@ -2004,8 +2081,30 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
         content.* = req.content;
         const scroller = View{ .kind = .{ .scroll_state = .{ .state = &popover_scroll, .content = content } } };
         try renderInto(ctx, scroller, target, canvas);
-    } else try renderInto(ctx, req.content, target, canvas);
+    } else {
+        // Lay out the node measured above: building it again would miss the
+        // frame's measure memo.
+        try paint(ctx, req.content, try engine.arrange(ctx.arena, node, target), canvas);
+    }
     try canvas.popClip();
+}
+
+/// Append tap-to-dismiss regions covering `area` minus every rect in `holes`:
+/// the first hole that meets `area` splits it into the bands above and below
+/// it and the strips beside it, and each piece goes on with the rest.
+fn appendDismiss(ctx: *const Context, area: Rect, holes: []const Rect, d: Binding(bool)) Allocator.Error!void {
+    if (area.width <= 0 or area.height <= 0) return;
+    for (holes, 0..) |hole, i| {
+        const cut = area.intersection(hole) orelse continue;
+        if (cut.width <= 0 or cut.height <= 0) continue;
+        const rest = holes[i + 1 ..];
+        try appendDismiss(ctx, .{ .x = area.x, .y = area.y, .width = area.width, .height = cut.y - area.y }, rest, d);
+        try appendDismiss(ctx, .{ .x = area.x, .y = cut.maxY(), .width = area.width, .height = area.maxY() - cut.maxY() }, rest, d);
+        try appendDismiss(ctx, .{ .x = area.x, .y = cut.y, .width = cut.x - area.x, .height = cut.height }, rest, d);
+        try appendDismiss(ctx, .{ .x = cut.maxX(), .y = cut.y, .width = area.maxX() - cut.maxX(), .height = cut.height }, rest, d);
+        return;
+    }
+    try ctx.hit_regions.append(ctx.arena, .{ .rect = area, .action = .{ .dismiss = d }, .disabled = false });
 }
 
 /// Scroll position of a popover too tall for the window (see `drawOverlay`).
@@ -2142,15 +2241,25 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     if (v.mods.on_drag) |dcb| {
         try ctx.hit_regions.append(ctx.arena, .{ .rect = outer, .action = .{ .drag = dcb }, .disabled = child_ctx.disabled });
     }
+    if (v.mods.on_hover) |hcb| if (ctx.hover_regions) |list| {
+        try list.append(ctx.arena, .{ .rect = outer, .callback = hcb, .disabled = child_ctx.disabled });
+    };
+    if (v.mods.popover_passthrough) if (ctx.passthrough) |list| try list.append(ctx.arena, outer);
+    if (v.mods.modal_passthrough) if (ctx.modal_passthrough) |list| try list.append(ctx.arena, outer);
 
     // `.clipped()`: content (not the background or border) is cut to the
-    // frame, and anything wholly outside it skips painting.
+    // frame, anything wholly outside it skips painting, and its input regions
+    // are cut to the frame too.
+    const marks = markInput(ctx);
     if (v.mods.clipped) {
         try canvas.pushClip(outer, v.mods.corner_radius);
         child_ctx.visible = if (ctx.visible) |vis| (vis.intersection(outer) orelse Rect{}) else outer;
     }
     try paintContent(&child_ctx, v, clr, canvas);
-    if (v.mods.clipped) try canvas.popClip();
+    if (v.mods.clipped) {
+        try canvas.popClip();
+        clipInput(ctx, marks, outer);
+    }
 
     // Border (in front of content).
     if (v.mods.border_color) |bc| {
@@ -2904,7 +3013,52 @@ fn paintScroll(ctx: *const Context, sd: ScrollData, rect: Rect, canvas: *Canvas)
     else
         Rect{ .x = rect.x - sd.offset, .y = rect.y, .width = csize.width, .height = rect.height };
     // renderInto (not render): overlays are drained once, by the top-level render.
+    const marks = markInput(ctx);
     try renderInto(ctx, sd.content.*, content_rect, canvas);
+    clipInput(ctx, marks, rect);
+}
+
+/// Where the input-region sinks stood before some clipped content painted
+/// (see `clipInput`).
+const InputMarks = struct { hits: usize, hovers: usize, scrolls: usize, passthrough: usize, modal_passthrough: usize };
+
+fn markInput(ctx: *const Context) InputMarks {
+    return .{
+        .hits = ctx.hit_regions.items.len,
+        .hovers = if (ctx.hover_regions) |l| l.items.len else 0,
+        .scrolls = if (ctx.scroll_regions) |l| l.items.len else 0,
+        .passthrough = if (ctx.passthrough) |l| l.items.len else 0,
+        .modal_passthrough = if (ctx.modal_passthrough) |l| l.items.len else 0,
+    };
+}
+
+/// Cut the tap, hover and scroll regions and passthrough frames content added
+/// since `marks` to `clip`, dropping those wholly outside it: what a clip
+/// hides takes no input either, so a row scrolled up under a toolbar cannot
+/// steal the toolbar's taps, nor keep a popover open through them.
+fn clipInput(ctx: *const Context, marks: InputMarks, clip: Rect) void {
+    clipRegions(HitRegion, ctx.hit_regions, marks.hits, clip);
+    if (ctx.hover_regions) |l| clipRegions(HoverRegion, l, marks.hovers, clip);
+    if (ctx.scroll_regions) |l| clipRegions(ScrollRegion, l, marks.scrolls, clip);
+    if (ctx.passthrough) |l| clipRegions(Rect, l, marks.passthrough, clip);
+    if (ctx.modal_passthrough) |l| clipRegions(Rect, l, marks.modal_passthrough, clip);
+}
+
+/// Cut the items of `list` from `from` on to `clip` (a `Rect`, or a region
+/// with a `rect`), dropping those wholly outside it.
+fn clipRegions(comptime T: type, list: *std.ArrayList(T), from: usize, clip: Rect) void {
+    var kept = from;
+    for (list.items[from..]) |r| {
+        var cut = r;
+        if (T == Rect) {
+            cut = r.intersection(clip) orelse continue;
+        } else {
+            cut.rect = r.rect.intersection(clip) orelse continue;
+        }
+        list.items[kept] = cut;
+        kept += 1;
+    }
+    list.shrinkRetainingCapacity(kept);
 }
 
 /// Paint a `ScrollViewState`: a vertical viewport scrolled by the app-owned
@@ -2926,7 +3080,9 @@ fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas
     // Paint (not render): overlays are drained once, by the top-level render.
     var inner = ctx.*;
     inner.visible = if (ctx.visible) |vis| (vis.intersection(rect) orelse Rect{}) else rect;
+    const marks = markInput(ctx);
     try paint(&inner, sd.content.*, try engine.arrange(ctx.arena, node, content_rect), canvas);
+    clipInput(ctx, marks, rect);
     if (ctx.scroll_regions) |regions| {
         try regions.append(ctx.arena, .{ .rect = rect, .state = sd.state });
     }
@@ -3361,6 +3517,25 @@ pub fn dispatchTripleClick(regions: []const HitRegion, p: Point) bool {
 /// platform convention.
 const scroll_speed: f32 = -28;
 
+/// The pointer moved from `from` to `to` (null = outside the window): tell
+/// each enabled hover region it left (`false`), then each it entered
+/// (`true`), so a menu bar hears the old title's leave before the new one's
+/// enter. Returns whether any callback fired.
+pub fn dispatchHover(regions: []const HoverRegion, from: ?Point, to: ?Point) bool {
+    var fired = false;
+    for ([_]bool{ false, true }) |entering| {
+        for (regions) |r| {
+            if (r.disabled) continue;
+            const was = if (from) |p| r.rect.contains(p) else false;
+            const now = if (to) |p| r.rect.contains(p) else false;
+            if (was == now or now != entering) continue;
+            r.callback.call(now);
+            fired = true;
+        }
+    }
+    return fired;
+}
+
 /// Route a wheel delta `dy` to the top-most scroll region containing `p`
 /// (back-to-front, like `dispatchTap`). Returns true if a region consumed it.
 pub fn dispatchScroll(regions: []const ScrollRegion, p: Point, dy: f32) bool {
@@ -3410,7 +3585,7 @@ pub fn scrollbarsAnimating(now_ms: u64) bool {
 fn performAction(a: HitAction, p: Point) void {
     switch (a) {
         .callback => |cb| cb.call(),
-        .toggle => |b| b.set(!b.get()),
+        .toggle, .dismiss => |b| b.set(!b.get()),
         .slider => |s| {
             s.binding.set(sliderValueForX(s.track, s.min, s.max, p.x));
             g_slider_drag = s.binding.ctx; // arm a drag so mouse-move tracks the knob
@@ -5024,7 +5199,7 @@ test "view: sheet enqueues an overlay, draws a scrim over content, dismisses on 
 
     // dismiss region is last; tapping the scrim flips presented to false
     const last = env.hits.items[env.hits.items.len - 1];
-    try testing.expect(last.action == .toggle);
+    try testing.expect(last.action == .dismiss);
     try testing.expect(dispatchTap(env.hits.items, .{ .x = 5, .y = 5 }));
     try testing.expect(!presented.get());
 
@@ -5070,6 +5245,132 @@ test "view: chaining .sheet and .alert keeps both overlays (neither clobbers)" {
     try testing.expectEqual(@as(usize, 2), ovs.items.len);
     try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
     try testing.expectEqual(OverlayStyle.alert, ovs.items[1].style);
+}
+
+test "view: onHover fires once on enter and once on leave, and only on movement" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var hovers: std.ArrayList(HoverRegion) = .empty;
+    c.hover_regions = &hovers;
+
+    const Probe = struct {
+        var enters: u32 = 0;
+        var leaves: u32 = 0;
+        fn seen(_: ?*anyopaque, inside: bool) void {
+            if (inside) enters += 1 else leaves += 1;
+        }
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 200, .height = 200 };
+    const tree = VStack(.{
+        Rectangle(Color.red).frame(100, 40).onHover(.{ .func = Probe.seen }),
+        Rectangle(Color.blue).frame(100, 40).onHover(.{ .func = Probe.seen }).disabled(true),
+        Spacer(),
+    }).alignment(.leading).frameMaxWidth().frameMaxHeight();
+    try render(&c, tree, root, &canvas);
+    try testing.expectEqual(@as(usize, 2), hovers.items.len);
+    const box = hovers.items[0].rect;
+    const inside = Point{ .x = box.x + 10, .y = box.y + 10 };
+    const outside = Point{ .x = 190, .y = 190 };
+
+    // No movement, or movement within or outside the frame: nothing fires.
+    try testing.expect(!dispatchHover(hovers.items, inside, inside));
+    try testing.expect(!dispatchHover(hovers.items, outside, .{ .x = 180, .y = 180 }));
+    try testing.expect(!dispatchHover(hovers.items, inside, .{ .x = box.x + 20, .y = box.y + 20 }));
+    // Entering fires once; leaving (or the pointer leaving the window) once.
+    try testing.expect(dispatchHover(hovers.items, outside, inside));
+    try testing.expect(dispatchHover(hovers.items, inside, null));
+    try testing.expectEqual(@as(u32, 1), Probe.enters);
+    try testing.expectEqual(@as(u32, 1), Probe.leaves);
+    // The disabled view never fires.
+    const off = hovers.items[1].rect;
+    try testing.expect(!dispatchHover(hovers.items, outside, .{ .x = off.x + 5, .y = off.y + 5 }));
+    try testing.expectEqual(@as(u32, 1), Probe.enters);
+}
+
+test "view: a popoverPassthrough view takes taps while a popover is open" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+
+    const Probe = struct {
+        var taps: u32 = 0;
+        fn tapped(_: ?*anyopaque) void {
+            taps += 1;
+        }
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 300, .height = 300 };
+    const tree = VStack(.{
+        HStack(.{
+            Rectangle(Color.red).frame(60, 30).popover(presented.binding(), Rectangle(Color.blue).frame(80, 80)),
+            Rectangle(Color.green).frame(60, 30).onTap(.{ .func = Probe.tapped }).popoverPassthrough(),
+            Spacer(),
+        }),
+        Spacer(),
+    }).frameMaxWidth().frameMaxHeight();
+    try render(&c, tree, root, &canvas);
+
+    // The second box sits at x 60..120 on the top row: a tap there reaches it
+    // and leaves the popover up.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 90, .y = 15 }));
+    try testing.expectEqual(@as(u32, 1), Probe.taps);
+    try testing.expect(presented.get());
+    // A tap anywhere else outside the popover still closes it.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 250, .y = 250 }));
+    try testing.expect(!presented.get());
+    try testing.expectEqual(@as(u32, 1), Probe.taps);
+}
+
+test "view: a modalPassthrough view takes taps under an alert; a popoverPassthrough one does not" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+
+    const Probe = struct {
+        var modal: u32 = 0;
+        var popover: u32 = 0;
+        fn modalTap(_: ?*anyopaque) void {
+            modal += 1;
+        }
+        fn popoverTap(_: ?*anyopaque) void {
+            popover += 1;
+        }
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 300, .height = 300 };
+    const tree = VStack(.{
+        HStack(.{
+            Rectangle(Color.green).frame(60, 30).onTap(.{ .func = Probe.modalTap }).modalPassthrough(),
+            Rectangle(Color.red).frame(60, 30).onTap(.{ .func = Probe.popoverTap }).popoverPassthrough(),
+            Spacer(),
+        }),
+        Spacer(),
+    }).frameMaxWidth().frameMaxHeight().alert(presented.binding(), Rectangle(Color.blue).frame(80, 80));
+    try render(&c, tree, root, &canvas);
+
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 30, .y = 15 }));
+    try testing.expectEqual(@as(u32, 1), Probe.modal);
+    try testing.expect(presented.get());
+    // The popover's passthrough means nothing to a modal: the scrim takes it.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 90, .y = 15 }));
+    try testing.expectEqual(@as(u32, 0), Probe.popover);
+    try testing.expect(!presented.get());
 }
 
 test "view: a popover taller than the window is cut to fit and scrolls" {
@@ -5614,15 +5915,108 @@ test "view: clipped keeps content inside the frame" {
     env.setup();
     defer env.deinit();
     var c = env.ctx();
-    // A 100-wide red bar in a 40-wide clipped frame paints only the frame.
+    // A 90-wide red row centered in a 40-wide clipped frame (x -25..65)
+    // paints only the frame.
     const v = HStack(.{
-        Rectangle(Color.red).frame(100, 20).frame(40, 20).clipped(),
+        HStack(.{ Rectangle(Color.red).frame(30, 20), Rectangle(Color.red).frame(60, 20) }).spacing(0).frame(40, 20).clipped(),
         Spacer(),
     }).spacing(0).frameMaxWidth().frameAlign(.leading);
     var fb = try renderToFb(&env, &c, v, .{ .x = 0, .y = 0, .width = 100, .height = 20 }, 100, 20);
     defer fb.deinit();
     try testing.expect(fb.at(20, 10).r > 0.9 and fb.at(20, 10).g < 0.2);
-    try testing.expect(fb.at(70, 10).g > 0.9);
+    try testing.expect(fb.at(55, 10).g > 0.9);
+}
+
+test "view: clipped content takes no taps outside the frame" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const Probe = struct {
+        var taps: u32 = 0;
+        fn tapped(_: ?*anyopaque) void {
+            taps += 1;
+        }
+    };
+    // A 90-wide row centered in a 40-wide frame overflows it: its tappable
+    // second box spans x 5..65, but only x 5..40 is visible, so only that
+    // part takes taps.
+    const v = HStack(.{
+        HStack(.{
+            Rectangle(Color.red).frame(30, 20),
+            Rectangle(Color.red).frame(60, 20).onTap(.{ .func = Probe.tapped }),
+        }).spacing(0).frame(40, 20).clipped(),
+        Spacer(),
+    }).spacing(0).frameMaxWidth().frameAlign(.leading);
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, v, .{ .x = 0, .y = 0, .width = 100, .height = 20 }, &canvas);
+    try testing.expect(!dispatchTap(env.hits.items, .{ .x = 55, .y = 10 }));
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 20, .y = 10 }));
+    try testing.expectEqual(@as(u32, 1), Probe.taps);
+}
+
+test "view: a row scrolled up under a header leaves the header its taps" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const Probe = struct {
+        var header: u32 = 0;
+        var rows: u32 = 0;
+        fn headerTap(_: ?*anyopaque) void {
+            header += 1;
+        }
+        fn rowTap(_: ?*anyopaque) void {
+            rows += 1;
+        }
+    };
+    var scroll: ScrollState = .{ .offset = 30 };
+    const row = Rectangle(Color.blue).frame(200, 40).onTap(.{ .func = Probe.rowTap });
+    // Scrolled by 30, the first row's frame (y 0..40) reaches up over the
+    // header (y 0..30), though the viewport (y 30..130) hides that part.
+    const v = VStack(.{
+        Rectangle(Color.red).frame(200, 30).onTap(.{ .func = Probe.headerTap }),
+        ScrollViewState(&scroll, VStack(.{ row, row, row, row, row }).spacing(0)).frameHeight(100),
+        Spacer(),
+    }).spacing(0).frameMaxWidth().frameMaxHeight();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, v, .{ .x = 0, .y = 0, .width = 200, .height = 200 }, &canvas);
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 100, .y = 15 }));
+    try testing.expectEqual(@as(u32, 1), Probe.header);
+    try testing.expectEqual(@as(u32, 0), Probe.rows);
+    // Inside the viewport the row still takes it.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 100, .y = 35 }));
+    try testing.expectEqual(@as(u32, 1), Probe.rows);
+}
+
+test "view: a passthrough row scrolled under a header leaves no hole there" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+
+    var scroll: ScrollState = .{ .offset = 30 };
+    const row = Rectangle(Color.blue).frame(200, 40);
+    // Scrolled by 30, the passthrough row's frame (y 0..40) reaches up over
+    // the header (y 0..30), though the viewport (y 30..130) hides that part.
+    const v = VStack(.{
+        Rectangle(Color.red).frame(200, 30),
+        ScrollViewState(&scroll, VStack(.{ row.popoverPassthrough(), row, row, row, row }).spacing(0)).frameHeight(100),
+        Rectangle(Color.green).frame(60, 30).popover(presented.binding(), Rectangle(Color.white).frame(40, 40)),
+        Spacer(),
+    }).spacing(0).frameMaxWidth().frameMaxHeight();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, v, .{ .x = 0, .y = 0, .width = 200, .height = 200 }, &canvas);
+    // The header is no hole: a tap there dismisses the popover.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 100, .y = 15 }));
+    try testing.expect(!presented.get());
 }
 
 test "view: buildTheme returns the theme setThemeTokens published" {

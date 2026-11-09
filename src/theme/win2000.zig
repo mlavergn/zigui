@@ -144,7 +144,19 @@ fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
     try bevel(s, rect, true); // a raised window/panel
 }
 
+/// The classic active caption: navy to sky blue, left to right, in both schemes.
+fn titleBar(s: Surface, rect: Rect) Err!void {
+    try s.horizontalGradient(rect, 0, Color.fromRgb8(10, 36, 106), Color.fromRgb8(166, 202, 240));
+}
+
+/// White on the blue caption.
+fn titleBarForeground(_: *const theme.Palette) Color {
+    return Color.white;
+}
+
 pub const painter = theme.Painter{
+    .titleBar = titleBar,
+    .titleBarForeground = titleBarForeground,
     .button = button,
     .field = field,
     .segmentedTrack = segmentedTrack,

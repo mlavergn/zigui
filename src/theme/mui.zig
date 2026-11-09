@@ -140,7 +140,19 @@ fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
     try s.stroke(rect, radius, 1, s.palette.separator);
 }
 
+/// A Material top app bar: the accent (primary) color.
+fn titleBar(s: Surface, rect: Rect) Err!void {
+    try s.fill(rect, 0, s.palette.accent);
+}
+
+/// Content on the app bar takes the on-accent color.
+fn titleBarForeground(p: *const theme.Palette) Color {
+    return p.on_accent;
+}
+
 pub const painter = theme.Painter{
+    .titleBar = titleBar,
+    .titleBarForeground = titleBarForeground,
     .button = button,
     .field = field,
     .segmentedTrack = segmentedTrack,

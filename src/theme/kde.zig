@@ -51,13 +51,13 @@ fn button(s: Surface, rect: Rect, role: Role, st: ControlState) Err!Color {
     const r = s.metrics.control_corner_radius;
     if (role == .plain) return s.palette.accent;
     if (role == .destructive) {
-        try s.vGradient(rect, r, s.palette.destructive.lighten(0.08), s.palette.destructive.darken(0.06));
+        try s.verticalGradient(rect, r, s.palette.destructive.lighten(0.08), s.palette.destructive.darken(0.06));
         try s.stroke(rect, r, 1, s.palette.destructive.darken(0.15));
         return s.palette.on_accent;
     }
     if (role == .prominent) {
         // The Breeze default action: the same gradient treatment in the accent.
-        try s.vGradient(rect, r, s.palette.accent.lighten(0.08), s.palette.accent.darken(0.06));
+        try s.verticalGradient(rect, r, s.palette.accent.lighten(0.08), s.palette.accent.darken(0.06));
         try s.stroke(rect, r, 1, s.palette.accent.darken(0.15));
         return s.palette.on_accent;
     }
@@ -65,7 +65,7 @@ fn button(s: Surface, rect: Rect, role: Role, st: ControlState) Err!Color {
     // border; hover lifts toward the accent.
     const base = s.palette.control_track;
     const top = if (st.hovered) base.lighten(0.12) else base.lighten(0.05);
-    try s.vGradient(rect, r, top, base.darken(0.04));
+    try s.verticalGradient(rect, r, top, base.darken(0.04));
     const border = if (st.hovered or st.focused) s.palette.accent else s.palette.control_border;
     try s.stroke(rect, r, 1, border);
     return s.palette.label;
@@ -87,7 +87,7 @@ fn segmentedTrack(s: Surface, rect: Rect) Err!void {
 fn segmentedSelection(s: Surface, seg: Rect) Err!Color {
     const inner = seg.insetBy(2, 2);
     const r = s.metrics.control_corner_radius - 1;
-    try s.vGradient(inner, r, s.palette.accent.lighten(0.06), s.palette.accent.darken(0.04));
+    try s.verticalGradient(inner, r, s.palette.accent.lighten(0.06), s.palette.accent.darken(0.04));
     return s.palette.on_accent;
 }
 
@@ -124,7 +124,7 @@ fn slider(s: Surface, track: Rect, frac: f32, knob: Rect, st: ControlState) Err!
 fn stepperBox(s: Surface, rect: Rect, st: ControlState) Err!void {
     _ = st;
     const r = s.metrics.control_corner_radius;
-    try s.vGradient(rect, r, s.palette.control_track.lighten(0.05), s.palette.control_track.darken(0.04));
+    try s.verticalGradient(rect, r, s.palette.control_track.lighten(0.05), s.palette.control_track.darken(0.04));
     try s.stroke(rect, r, 1, s.palette.control_border);
 }
 
@@ -142,7 +142,13 @@ fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
     try s.stroke(rect, radius, 1, s.palette.control_border);
 }
 
+/// Breeze's header color: #DEE0E2 in light, #2A2E32 in dark.
+fn titleBar(s: Surface, rect: Rect) Err!void {
+    try s.fill(rect, 0, if (s.scheme == .dark) Color.fromRgb8(42, 46, 50) else Color.fromRgb8(222, 224, 226));
+}
+
 pub const painter = theme.Painter{
+    .titleBar = titleBar,
     .button = button,
     .field = field,
     .segmentedTrack = segmentedTrack,

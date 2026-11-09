@@ -90,6 +90,12 @@ pub const default_theme = macos.light;
 
 /// Escaped values for a freedesktop desktop entry (`.desktop`).
 pub const desktop_entry = @import("desktop_entry.zig");
+/// The key-up and quit handlers `app.zig` forwards SDL's events to (pure).
+pub const AppHooks = @import("app_hooks.zig").AppHooks;
+/// What a press in a window does for the window manager (pure; `app.zig` maps it to SDL).
+pub const WindowHit = @import("window_hit.zig").WindowHit;
+/// The window state a `WindowHit` is found from.
+pub const WindowHitArea = @import("window_hit.zig").WindowHitArea;
 pub const view = @import("view/view.zig");
 pub const View = view.View;
 pub const Context = view.Context;
@@ -98,6 +104,9 @@ pub const action = view.action;
 pub const actionCtx = view.actionCtx;
 pub const HitRegion = view.HitRegion;
 pub const dispatchTap = view.dispatchTap;
+pub const HoverCallback = view.HoverCallback;
+pub const HoverRegion = view.HoverRegion;
+pub const dispatchHover = view.dispatchHover;
 pub const dispatchDoubleClick = view.dispatchDoubleClick;
 pub const setTapCount = view.setTapCount;
 pub const selectedText = view.selectedText;
@@ -229,6 +238,8 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("integration_test.zig");
     _ = @import("desktop_entry.zig");
+    _ = @import("app_hooks.zig");
+    _ = @import("window_hit.zig");
 }
 
 test "version is parsed from the package manifest" {

@@ -128,6 +128,16 @@ const AppState = struct {
     show_alert: zigui.State(bool),
     show_popover: zigui.State(bool),
     menu_open: zigui.State(bool),
+    /// The pointer is over the `onHover` demo box.
+    hovering: zigui.State(bool),
+    /// The passthrough demo's popover, and the taps its passthrough button took.
+    show_pass_popover: zigui.State(bool),
+    pass_taps: zigui.State(i64),
+    /// The last key-up's SDL keycode (0 before the first).
+    last_key_up: zigui.State(i64),
+    /// Ask before quitting (the quit-handler demo), and the question it shows.
+    ask_quit: zigui.State(bool),
+    show_quit: zigui.State(bool),
 
     // Per-panel page scroll + the multi-line editor
     page_scroll: zigui.ScrollState,
@@ -157,6 +167,32 @@ const AppState = struct {
     }
     fn togglePopover(self: *AppState) void {
         self.show_popover.set(!self.show_popover.get());
+    }
+    fn hovered(ctx: ?*anyopaque, inside: bool) void {
+        const self: *AppState = @ptrCast(@alignCast(ctx.?));
+        self.hovering.set(inside);
+    }
+    fn togglePassPopover(self: *AppState) void {
+        self.show_pass_popover.set(!self.show_pass_popover.get());
+    }
+    fn passTap(self: *AppState) void {
+        self.pass_taps.set(self.pass_taps.get() + 1);
+    }
+    fn cancelQuit(self: *AppState) void {
+        self.show_quit.set(false);
+    }
+    fn minimize(_: *AppState) void {
+        app.minimizeWindow();
+    }
+    fn maximize(_: *AppState) void {
+        app.toggleMaximized();
+    }
+    fn close(_: *AppState) void {
+        app.requestClose();
+    }
+    fn confirmQuit(self: *AppState) void {
+        self.show_quit.set(false);
+        app.quit();
     }
     fn noop(_: *AppState) void {}
 };
@@ -457,6 +493,26 @@ fn overlaysPanel(st: *AppState) zigui.View {
             }).spacing(8).padding(14).frameWidth(220)),
             zigui.Spacer(),
         })),
+        card("Popover passthrough", zigui.HStack(.{
+            zigui.Button("Open popover", zigui.actionCtx(AppState, st, AppState.togglePassPopover))
+                .popover(st.show_pass_popover.binding(), zigui.WrappedText("The button beside this trigger still takes taps; anywhere else closes it.").padding(14).frameWidth(220)),
+            zigui.Button("Tap me while it is open", zigui.actionCtx(AppState, st, AppState.passTap)).popoverPassthrough(),
+            zigui.Text(zigui.view.fmt("{d} taps", .{st.pass_taps.get()})).foreground(t().colors.secondary_label),
+            zigui.Spacer(),
+        }).spacing(10)),
+        card("onHover", zigui.HStack(.{
+            zigui.RoundedRectangle(if (st.hovering.get()) t().colors.accent else t().colors.control_track, 8)
+                .frame(120, 44)
+                .onHover(.{ .ctx = st, .func = AppState.hovered }),
+            zigui.Text(if (st.hovering.get()) "Pointer inside" else "Point at the box").foreground(t().colors.secondary_label),
+            zigui.Spacer(),
+        }).spacing(12)),
+        card("Custom title bar (Config.custom_titlebar)", titleBarDemo(st)),
+        card("Key-ups and quitting", zigui.VStack(.{
+            leading(zigui.Text(if (st.last_key_up.get() == 0) "Press and release a key." else zigui.view.fmt("Last key-up: keycode 0x{x}", .{st.last_key_up.get()}))
+                .foreground(t().colors.secondary_label)),
+            row("Ask before quitting (close button, ⌘Q)", zigui.Toggle("", st.ask_quit.binding())),
+        }).spacing(10)),
     }).spacing(16);
 }
 
@@ -637,6 +693,16 @@ fn body(st: *AppState) zigui.View {
         }).frameMaxWidth(),
     }).spacing(12).padding(20).frameWidth(380);
 
+    const quit_content = zigui.VStack(.{
+        zigui.Text("Quit the showcase?").font(.headline),
+        zigui.WrappedText("The quit handler refused the quit and asked instead."),
+        zigui.HStack(.{
+            zigui.Spacer(),
+            zigui.Button("Cancel", zigui.actionCtx(AppState, st, AppState.cancelQuit)),
+            zigui.ButtonRoled("Quit", .destructive, zigui.actionCtx(AppState, st, AppState.confirmQuit)),
+        }).spacing(8),
+    }).spacing(12).padding(20).frameWidth(300);
+
     const alert_content = zigui.VStack(.{
         zigui.Icon(.info, 28, t().colors.accent),
         zigui.Text("Heads up").font(.headline),
@@ -651,7 +717,51 @@ fn body(st: *AppState) zigui.View {
         t().colors.sidebar_background orelse t().colors.secondary_background,
     )
         .sheet(st.show_sheet.binding(), sheet_content)
-        .alert(st.show_alert.binding(), alert_content);
+        .alert(st.show_alert.binding(), alert_content)
+        .alert(st.show_quit.binding(), quit_content);
+}
+
+/// The theme family's own title bar (`Theme.drawTitleBar`) under its text
+/// color (`titleBarForeground`), with buttons that minimize, maximize and close
+/// the window as a custom title bar's would. Close is `modalPassthrough`, so it
+/// still works with the sheet or alert open; with "Ask before quitting" on, it
+/// asks through the quit handler.
+fn titleBarDemo(st: *AppState) zigui.View {
+    const fg = t().titleBarForeground();
+    return zigui.ZStack(.{
+        zigui.Drawing(AppState, st, drawTitleBar).frameMaxWidth().frameHeight(32),
+        zigui.HStack(.{
+            zigui.Icon(.boxes, 16, fg),
+            zigui.Text("File").foreground(fg),
+            zigui.Text("View").foreground(fg),
+            zigui.Spacer(),
+            zigui.Text("~/src/zigui").font(.footnote).foreground(fg),
+            zigui.Spacer(),
+            zigui.Text("–").foreground(fg).padding(6).onTap(zigui.actionCtx(AppState, st, AppState.minimize)),
+            zigui.Text(if (app.isMaximized()) "❐" else "□").foreground(fg).padding(6).onTap(zigui.actionCtx(AppState, st, AppState.maximize)),
+            zigui.Text("×").foreground(fg).padding(6).onTap(zigui.actionCtx(AppState, st, AppState.close)).modalPassthrough(),
+        }).spacing(12).paddingInsets(.{ .leading = 10, .trailing = 4 }).frameHeight(32),
+    }).frameMaxWidth().frameHeight(32);
+}
+
+fn drawTitleBar(_: *const AppState, pen: *zigui.Pen, r: zigui.Rect) std.mem.Allocator.Error!void {
+    try pen.ctx.theme.drawTitleBar(pen.ctx.surface(pen.canvas), r);
+}
+
+/// The key-up demo: remember the last keycode released.
+fn onKeyUp(key: u32, mods: u16) void {
+    _ = mods;
+    const st = g_app orelse return;
+    st.last_key_up.set(key);
+}
+
+/// The quit-handler demo: with "Ask before quitting" on, a quit shows a
+/// question instead, whose Quit button calls `app.quit()` (never asked).
+fn onQuit() bool {
+    const st = g_app orelse return true;
+    if (!st.ask_quit.get()) return true;
+    st.show_quit.set(true);
+    return false;
 }
 
 // ── Headless screenshot (no window) ───────────────────────────────────────────
@@ -813,6 +923,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .show_alert = zigui.State(bool).init(alloc, false),
         .show_popover = zigui.State(bool).init(alloc, false),
         .menu_open = zigui.State(bool).init(alloc, false),
+        .hovering = zigui.State(bool).init(alloc, false),
+        .show_pass_popover = zigui.State(bool).init(alloc, false),
+        .pass_taps = zigui.State(i64).init(alloc, 0),
+        .last_key_up = zigui.State(i64).init(alloc, 0),
+        .ask_quit = zigui.State(bool).init(alloc, false),
+        .show_quit = zigui.State(bool).init(alloc, false),
         .page_scroll = .{},
         .editor = zigui.TextFieldState.init(alloc),
         .editor_scroll = .{},
@@ -839,6 +955,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         st.show_alert.deinit();
         st.show_popover.deinit();
         st.menu_open.deinit();
+        st.hovering.deinit();
+        st.show_pass_popover.deinit();
+        st.pass_taps.deinit();
+        st.last_key_up.deinit();
+        st.ask_quit.deinit();
+        st.show_quit.deinit();
         st.editor.deinit();
     }
     st.editor.setText(
@@ -851,6 +973,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     ) catch {};
     g_app = &st;
     app.setThemeProvider(themeProvider);
+    app.setKeyUpHandler(onKeyUp);
+    app.setQuitHandler(onQuit);
 
     // `--screenshot <out.bmp> [section]` renders one frame headlessly (no window).
     var shot: ?[:0]const u8 = null;
@@ -881,6 +1005,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             st.show_popover.set(true);
         } else if (std.mem.eql(u8, a, "--menu")) {
             st.menu_open.set(true);
+        } else if (std.mem.eql(u8, a, "--passthrough")) {
+            st.show_pass_popover.set(true);
         } else if (std.mem.eql(u8, a, "--install-desktop")) {
             // Linux: add a launcher entry + icon (GNOME/Wayland shows the
             // icon only through one). See app.installDesktopEntry.

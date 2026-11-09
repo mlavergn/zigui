@@ -65,6 +65,14 @@ pub const Config = struct {
     /// that draws its own band behaves like a native titlebar.
     unified_titlebar: bool = false,
     drag_band: f32 = 0,
+    /// Off macOS: no OS title bar or frame (a borderless, resizable window);
+    /// the app draws its own title bar in the top `drag_band`, whose empty
+    /// space drags the window, and the window's edges resize it
+    /// (`resize_edge` points in, unless maximized). The app's window buttons
+    /// call `minimizeWindow`, `toggleMaximized` and `requestClose`. On
+    /// Windows the window keeps the system shadow, rounded corners (11) and
+    /// Aero Snap; Linux window managers draw no shadow for it. Ignored on macOS.
+    custom_titlebar: bool = false,
     /// macOS menu bar menus, after the application menu (ignored elsewhere:
     /// there is no menu bar to put them in).
     menus: []const Menu = &.{},
@@ -254,6 +262,33 @@ pub fn showWindow() void {
         _ = c.SDL_RaiseWindow(w);
     }
 }
+/// Minimize the main window (a custom title bar's minimize button).
+pub fn minimizeWindow() void {
+    if (g_window) |w| _ = c.SDL_MinimizeWindow(w);
+}
+
+/// Maximize the main window, or restore it when it is maximized (a custom
+/// title bar's maximize button).
+pub fn toggleMaximized() void {
+    const w = g_window orelse return;
+    if (isMaximized()) _ = c.SDL_RestoreWindow(w) else _ = c.SDL_MaximizeWindow(w);
+}
+
+/// Whether the main window is maximized (a custom title bar draws restore
+/// rather than maximize).
+pub fn isMaximized() bool {
+    const w = g_window orelse return false;
+    return (c.SDL_GetWindowFlags(w) & c.SDL_WINDOW_MAXIMIZED) != 0;
+}
+
+/// Ask to close the main window, as its OS close button does: with
+/// `Config.hide_on_close` it hides to the tray, else the quit handler
+/// (`setQuitHandler`) may refuse (a custom title bar's close button).
+pub fn requestClose() void {
+    if (g_hide_on_close) return hideWindow();
+    if (g_running) |r| g_hooks.requestQuit(r);
+}
+
 /// Hide the window without quitting (the app keeps running in the tray).
 pub fn hideWindow() void {
     if (g_window) |w| _ = c.SDL_HideWindow(w);
@@ -408,6 +443,30 @@ pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
     g_key_fn = f;
 }
 
+/// The key-up and quit handlers (see `zigui.AppHooks`).
+var g_hooks: zigui.AppHooks = .{};
+
+/// An optional handler called on every main-window key-up with the SDL keycode
+/// and modifier mask, beside `setKeyHandler`'s key-downs (which it leaves
+/// alone). An app tells an Alt tap from the Alt of Alt+Tab or Alt+F4 with it.
+pub fn setKeyUpHandler(f: ?*const fn (key: u32, mods: u16) void) void {
+    g_hooks.key_up = f;
+}
+
+/// An optional handler asked before a quit: on `SDL_EVENT_QUIT` (⌘Q, the app
+/// menu's Quit, a logout) and on the main window's close button. Returning
+/// false keeps the loop running (an app with unsaved work asks first);
+/// unset, both quit as before. `quit()` never asks, so the app's own Quit,
+/// after its question, always ends the loop. The tray's hide-on-close is
+/// not a quit and is not asked about. Set it before SDL starts (`run`,
+/// `Tray.create` or `createStatusItem`, whichever comes first): while one is
+/// set, SDL's signal handlers are turned off (`SDL_HINT_NO_SIGNAL_HANDLERS`),
+/// so SIGINT and SIGTERM end the process as usual rather than becoming a quit
+/// the handler could refuse.
+pub fn setQuitHandler(f: ?*const fn () bool) void {
+    g_hooks.quit = f;
+}
+
 /// An optional handler for the main window gaining (true) or losing (false)
 /// keyboard focus — an app re-reads state that may have changed while another
 /// app was in front.
@@ -481,6 +540,10 @@ pub fn setDropHandler(f: ?*const fn (path: []const u8) void) void {
 /// The cursor's last known position in logical points, or null when it has left
 /// the window. Fed into `Context.hover_point` each frame for hover highlights.
 var g_hover_point: ?zigui.geometry.Point = null;
+
+/// The main window's `onHover` regions from the last frame (arena-backed, like
+/// the hit regions), compared with each pointer move by `zigui.dispatchHover`.
+var g_hover_regions: std.ArrayList(zigui.HoverRegion) = .empty;
 
 /// Scale converting SDL mouse coordinates (logical window points) into the
 /// design-point space that hit/scroll regions live in. `drawFrame` updates it
@@ -706,8 +769,15 @@ fn trayThunk(userdata: ?*anyopaque, entry: ?*c.SDL_TrayEntry) callconv(.c) void 
     cb.call();
 }
 
-/// Build an `SDL_Surface` from row-major RGBA8 pixels (the format zigui's
-/// `Framebuffer.toRgba8Alloc` produces). Returns null on failure.
+/// What every `SDL_Init` here needs first, since SDL reads it only when it
+/// starts (a tray or status item may start it before `run`): with a quit
+/// handler, SDL's signal handlers stay off, as a handler may refuse a quit
+/// (see `setQuitHandler`); and a UTF-8 locale (see `useUtf8Locale`).
+fn beforeSdlInit() void {
+    if (g_hooks.quit != null) _ = c.SDL_SetHint(c.SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    useUtf8Locale();
+}
+
 /// Give the C library a UTF-8 character-type locale before SDL talks to the
 /// display. Unix processes start in the "C" locale, and on X11 (which SDL
 /// also picks under GNOME/XWayland) the legacy WM_NAME title goes through
@@ -741,29 +811,16 @@ fn useUtf8Locale() void {
 pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
     if (builtin.os.tag != .linux) return false;
     var exe_buf: [4096]u8 = undefined;
-    const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
-    if (n <= 0) return false;
-    const exe = exe_buf[0..@intCast(n)];
-    // SDL's default app ID is the executable's basename; match it.
-    const id = exe[(std.mem.lastIndexOfScalar(u8, exe, '/') orelse return false) + 1 ..];
-
     var data_buf: [4096]u8 = undefined;
-    const data_dir: []const u8 = if (c.SDL_getenv("XDG_DATA_HOME")) |x|
-        std.mem.span(x)
-    else if (c.SDL_getenv("HOME")) |h|
-        std.fmt.bufPrint(&data_buf, "{s}/.local/share", .{std.mem.span(h)}) catch return false
-    else
-        return false;
-
-    var path_buf: [4096]u8 = undefined;
+    var desk_buf: [4096]u8 = undefined;
     var icon_buf: [4096]u8 = undefined;
-    const icon_dir = std.fmt.bufPrintSentinel(&path_buf, "{s}/icons/hicolor/256x256/apps", .{data_dir}, 0) catch return false;
-    if (!c.SDL_CreateDirectory(icon_dir.ptr)) return logInstallError(icon_dir);
-    const icon_path = std.fmt.bufPrintSentinel(&icon_buf, "{s}/{s}.png", .{ icon_dir, id }, 0) catch return false;
-    if (!c.SDL_SaveFile(icon_path.ptr, icon_png.ptr, icon_png.len)) return logInstallError(icon_path);
-
-    const app_dir = std.fmt.bufPrintSentinel(&path_buf, "{s}/applications", .{data_dir}, 0) catch return false;
-    if (!c.SDL_CreateDirectory(app_dir.ptr)) return logInstallError(app_dir);
+    const paths = entryPaths(&exe_buf, &data_buf, &desk_buf, &icon_buf) orelse {
+        std.log.err("zigui: no desktop entry: cannot find the executable's path or the data folder", .{});
+        return false;
+    };
+    if (!createParentDir(paths.icon)) return false;
+    if (!c.SDL_SaveFile(paths.icon.ptr, icon_png.ptr, icon_png.len)) return logInstallError(paths.icon);
+    if (!createParentDir(paths.desktop)) return false;
     // Each value escaped per the Desktop Entry Specification, so a path with
     // spaces, quotes, `$`, `%` or backslashes means what it says (a path that
     // cannot be written, with a control character in it, is refused). Exec is
@@ -775,10 +832,10 @@ pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
     var name_buf: [2 * 256]u8 = undefined;
     var icon_value_buf: [2 * 4096]u8 = undefined;
     var id_buf: [2 * 4096]u8 = undefined;
-    const exec = zigui.desktop_entry.execValue(&exec_buf, exe, false) orelse return logUnwritable("executable path", exe);
+    const exec = zigui.desktop_entry.execValue(&exec_buf, paths.exe, false) orelse return logUnwritable("executable path", paths.exe);
     const name_value = zigui.desktop_entry.stringValue(&name_buf, name) orelse return logUnwritable("name", name);
-    const icon_value = zigui.desktop_entry.stringValue(&icon_value_buf, icon_path) orelse return logUnwritable("icon path", icon_path);
-    const id_value = zigui.desktop_entry.stringValue(&id_buf, id) orelse return logUnwritable("app ID", id);
+    const icon_value = zigui.desktop_entry.stringValue(&icon_value_buf, paths.icon) orelse return logUnwritable("icon path", paths.icon);
+    const id_value = zigui.desktop_entry.stringValue(&id_buf, paths.id) orelse return logUnwritable("app ID", paths.id);
     var entry_buf: [exec_buf.len + name_buf.len + icon_value_buf.len + id_buf.len + 256]u8 = undefined;
     const entry = std.fmt.bufPrint(&entry_buf,
         \\[Desktop Entry]
@@ -791,10 +848,18 @@ pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
         \\Categories=Utility;
         \\
     , .{ name_value, exec, icon_value, id_value }) catch return false;
-    var desk_buf: [4096]u8 = undefined;
-    const desk_path = std.fmt.bufPrintSentinel(&desk_buf, "{s}/{s}.desktop", .{ app_dir, id }, 0) catch return false;
-    if (!c.SDL_SaveFile(desk_path.ptr, entry.ptr, entry.len)) return logInstallError(desk_path);
-    std.log.info("zigui: installed {s} (icon {s})", .{ desk_path, icon_path });
+    if (!c.SDL_SaveFile(paths.desktop.ptr, entry.ptr, entry.len)) return logInstallError(paths.desktop);
+    std.log.info("zigui: installed {s} (icon {s})", .{ paths.desktop, paths.icon });
+    return true;
+}
+
+/// Creates the folder `path` goes in, and any missing above it (logged on
+/// failure).
+fn createParentDir(path: []const u8) bool {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return true;
+    var buf: [4096]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&buf, "{s}", .{path[0..slash]}, 0) catch return false;
+    if (!c.SDL_CreateDirectory(dir.ptr)) return logInstallError(dir);
     return true;
 }
 
@@ -816,10 +881,15 @@ pub const DesktopEntryState = enum {
 /// The per-user entry's path for the running executable, and its app ID.
 const EntryPaths = struct { desktop: [:0]const u8, icon: [:0]const u8, id: []const u8, exe: []const u8 };
 
+/// The running executable's path, its app ID, and where its per-user entry and
+/// icon go (`$XDG_DATA_HOME`, default `~/.local/share`). Null when the
+/// executable's path or the data folder cannot be found, or a path is too long.
 fn entryPaths(exe_buf: *[4096]u8, data_buf: *[4096]u8, desk_buf: *[4096]u8, icon_buf: *[4096]u8) ?EntryPaths {
     const n = std.c.readlink("/proc/self/exe", exe_buf, exe_buf.len);
-    if (n <= 0) return null;
+    // A path that fills the buffer may have been cut short.
+    if (n <= 0 or n >= exe_buf.len) return null;
     const exe = exe_buf[0..@intCast(n)];
+    // SDL's default app ID is the executable's basename; match it.
     const id = exe[(std.mem.lastIndexOfScalar(u8, exe, '/') orelse return null) + 1 ..];
     const data_dir: []const u8 = if (c.SDL_getenv("XDG_DATA_HOME")) |x|
         std.mem.span(x)
@@ -905,6 +975,8 @@ fn hasIconResource() bool {
     return k32.FindResourceW(k32.GetModuleHandleW(null), 1, rt_group_icon) != null;
 }
 
+/// Build an `SDL_Surface` from row-major RGBA8 pixels (the format zigui's
+/// `Framebuffer.toRgba8Alloc` produces). Returns null on failure.
 fn makeSurface(rgba: []const u8, w: c_int, h: c_int) ?*c.SDL_Surface {
     const surf = c.SDL_CreateSurface(w, h, c.SDL_PIXELFORMAT_ABGR8888) orelse return null;
     const uw: usize = @intCast(w);
@@ -986,7 +1058,7 @@ pub const Tray = struct {
     /// initialized if it isn't already (idempotent), so this may be called
     /// before `run`.
     pub fn create(gpa: std.mem.Allocator, rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8) !Tray {
-        useUtf8Locale();
+        beforeSdlInit();
         _ = c.SDL_Init(c.SDL_INIT_VIDEO);
         const surf = makeSurface(rgba, w, h) orelse return Error.TrayInit;
         const handle = c.SDL_CreateTray(surf, tooltip.ptr) orelse {
@@ -1060,7 +1132,7 @@ pub const Tray = struct {
 /// macOS the icon shows at half its pixel size in points (36 px → 18 pt, the
 /// usual menu-bar glyph).
 pub fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
-    useUtf8Locale();
+    beforeSdlInit();
     _ = c.SDL_Init(c.SDL_INIT_VIDEO);
     switch (builtin.os.tag) {
         .macos => return cocoa.createStatusItem(rgba, w, h, tooltip, on_click),
@@ -1115,18 +1187,19 @@ pub fn run(
     // A hide-to-tray app must not quit when its last visible window is closed:
     // SDL would send SDL_EVENT_QUIT itself, before our close handler hides it.
     if (cfg.hide_on_close) _ = c.SDL_SetHint(c.SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
-    useUtf8Locale();
+    beforeSdlInit();
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
         return Error.SdlInit;
     }
     defer c.SDL_Quit();
 
+    const custom_titlebar = cfg.custom_titlebar and builtin.os.tag != .macos;
     const window = c.SDL_CreateWindow(
         cfg.title.ptr,
         @intCast(cfg.width),
         @intCast(cfg.height),
-        c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY,
+        c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY | (if (custom_titlebar) c.SDL_WINDOW_BORDERLESS else 0),
     ) orelse {
         std.log.err("SDL_CreateWindow failed: {s}", .{c.SDL_GetError()});
         return Error.SdlInit;
@@ -1137,8 +1210,9 @@ pub fn run(
         _ = c.SDL_SetWindowMinimumSize(window, @intCast(cfg.min_width), @intCast(cfg.min_height));
     if (cfg.unified_titlebar and builtin.os.tag == .macos) cocoa.unifyTitlebar(window);
     if ((cfg.menus.len > 0 or cfg.settings != null) and builtin.os.tag == .macos) cocoa.setMenuBar(cfg.menus, cfg.settings);
-    if (cfg.drag_band > 0) {
+    if (cfg.drag_band > 0 or custom_titlebar) {
         g_drag_band = cfg.drag_band;
+        g_resize_edge = if (custom_titlebar) resize_edge else 0;
         _ = c.SDL_SetWindowHitTest(window, bandHitTest, null);
     }
 
@@ -1324,6 +1398,8 @@ pub fn run(
         view_fn: ?*const fn (*AppState) zigui.View = null,
         /// Where this frame's hover point lives (main window or panel).
         hover: ?*?zigui.geometry.Point = null,
+        /// Where this frame's `onHover` regions go (the main window only).
+        hover_regions: ?*std.ArrayList(zigui.HoverRegion) = null,
         /// Resize the window to the view tree's content height each frame
         /// (the tray popover: no scrollbars, like Swift's auto-sizing panel).
         auto_height: bool = false,
@@ -1430,6 +1506,10 @@ pub fn run(
             ctx.icon_cache = fr.icon_cache;
             ctx.fonts = g_fonts;
             ctx.hover_point = if (fr.hover) |h| h.* else null;
+            if (fr.hover_regions) |list| {
+                list.* = .empty; // arena-backed, like `hits`
+                ctx.hover_regions = list;
+            }
 
             // Auto-height panel: measure the tree and resize the window to it,
             // clamped to the screen's usable height. Swift's MenuBarExtra panel
@@ -1593,6 +1673,7 @@ pub fn run(
         .cfg = cfg,
         .st = st,
         .hover = &g_hover_point,
+        .hover_regions = &g_hover_regions,
         .texture = &texture,
         .tex_w = &tex_w,
         .tex_h = &tex_h,
@@ -1731,16 +1812,44 @@ var g_drag_band: f32 = 0;
 /// the event pump, where the loop's lists are out of reach).
 var g_band_hits: []const zigui.HitRegion = &.{};
 
+/// How far in from a custom-title-bar window's edges a press resizes it, in points.
+const resize_edge: f32 = 6;
+/// The resize edge in effect: `resize_edge` with a custom title bar, else 0.
+var g_resize_edge: f32 = 0;
+
 /// Empty space in the top band drags the window; anything tappable there
-/// (a toolbar button, a title menu) keeps its clicks.
-fn bandHitTest(_: ?*c.SDL_Window, area: [*c]const c.SDL_Point, _: ?*anyopaque) callconv(.c) c.SDL_HitTestResult {
+/// (a toolbar button, a title menu) keeps its clicks, an overlay's dismiss
+/// region excepted. With a custom title bar the edges resize the window
+/// unless it is maximized. Fullscreen, the whole window is content. See
+/// `zigui.WindowHitArea`.
+fn bandHitTest(win: ?*c.SDL_Window, area: [*c]const c.SDL_Point, _: ?*anyopaque) callconv(.c) c.SDL_HitTestResult {
     const p = eventPoint(@floatFromInt(area.*.x), @floatFromInt(area.*.y));
-    if (p.y >= g_drag_band or zigui.contextMenuOpen()) return c.SDL_HITTEST_NORMAL;
-    for (g_band_hits) |h| {
-        if (h.action == .secondary) continue;
-        if (p.x >= h.rect.x and p.x < h.rect.x + h.rect.width and p.y >= h.rect.y and p.y < h.rect.y + h.rect.height) return c.SDL_HITTEST_NORMAL;
-    }
-    return c.SDL_HITTEST_DRAGGABLE;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    if (win) |wp| _ = c.SDL_GetWindowSize(wp, &w, &h);
+    const flags: c.SDL_WindowFlags = if (win) |wp| c.SDL_GetWindowFlags(wp) else 0;
+    const maximized = (flags & c.SDL_WINDOW_MAXIMIZED) != 0;
+    const size = eventPoint(@floatFromInt(w), @floatFromInt(h));
+    const hit_area: zigui.WindowHitArea = .{
+        .size = .{ .width = size.x, .height = size.y },
+        .drag_band = g_drag_band,
+        .resize_edge = if (maximized) 0 else g_resize_edge,
+        .hits = g_band_hits,
+        .menu_open = zigui.contextMenuOpen(),
+        .fullscreen = (flags & c.SDL_WINDOW_FULLSCREEN) != 0,
+    };
+    return switch (hit_area.at(p)) {
+        .normal => c.SDL_HITTEST_NORMAL,
+        .draggable => c.SDL_HITTEST_DRAGGABLE,
+        .resize_top_left => c.SDL_HITTEST_RESIZE_TOPLEFT,
+        .resize_top => c.SDL_HITTEST_RESIZE_TOP,
+        .resize_top_right => c.SDL_HITTEST_RESIZE_TOPRIGHT,
+        .resize_right => c.SDL_HITTEST_RESIZE_RIGHT,
+        .resize_bottom_right => c.SDL_HITTEST_RESIZE_BOTTOMRIGHT,
+        .resize_bottom => c.SDL_HITTEST_RESIZE_BOTTOM,
+        .resize_bottom_left => c.SDL_HITTEST_RESIZE_BOTTOMLEFT,
+        .resize_left => c.SDL_HITTEST_RESIZE_LEFT,
+    };
 }
 
 /// The bits of AppKit SDL does not expose, reached through the Objective-C runtime.
@@ -1952,24 +2061,53 @@ const cocoa = struct {
         status_cb = null;
     }
 
-    /// Keep SDL's application menu (About / Hide / Quit) and replace the rest;
-    /// `settings` adds "Settings… ⌘," to the application menu, after About.
+    /// The index of `menu`'s item whose key equivalent is `key`, or -1.
+    fn indexOfKey(menu: Id, key: [*:0]const u8) i64 {
+        const want = nsString(key);
+        const n = send(i64, menu, "numberOfItems", .{});
+        var i: i64 = 0;
+        while (i < n) : (i += 1) {
+            const item = send(Id, menu, "itemAtIndex:", .{i}) orelse continue;
+            const k = send(Id, item, "keyEquivalent", .{}) orelse continue;
+            if (send(bool, k, "isEqualToString:", .{want})) return i;
+        }
+        return -1;
+    }
+
+    /// Keep SDL's application menu (About / Hide / Quit) and, when `menus` is
+    /// non-empty, replace the rest (SDL's Window menu stays otherwise);
+    /// `settings` turns SDL's placeholder "Preferences… ⌘," into a working
+    /// "Settings… ⌘,".
     fn setMenuBar(menus: []const Menu, settings: ?zigui.Callback) void {
         const ns_app = send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
         const bar = send(Id, ns_app, "mainMenu", .{}) orelse return;
-        while (send(i64, bar, "numberOfItems", .{}) > 1) send(void, bar, "removeItemAtIndex:", .{@as(i64, 1)});
+        if (menus.len > 0) {
+            while (send(i64, bar, "numberOfItems", .{}) > 1) send(void, bar, "removeItemAtIndex:", .{@as(i64, 1)});
+        }
         const tgt = menuTarget();
         if (settings) |cb| settings: {
             const app_item = send(Id, bar, "itemAtIndex:", .{@as(i64, 0)}) orelse break :settings;
             const app_menu = send(Id, app_item, "submenu", .{}) orelse break :settings;
-            const item = send(Id, send(Id, objc_getClass("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{ nsString("Settings…"), sel_registerName("fire:"), nsString(",") });
-            send(void, item, "setTag:", .{@as(i64, @intCast(actions.items.len))});
             actions.append(std.heap.page_allocator, cb) catch break :settings;
+            const tag: i64 = @intCast(actions.items.len - 1);
+            // SDL's app menu has a disabled "Preferences… ⌘," (no action):
+            // take it over, so there is one item and one ⌘, in its place.
+            // Found by its key, not its title: macOS 13+ retitles it "Settings…".
+            const pref = indexOfKey(app_menu, ",");
+            const item = if (pref >= 0)
+                send(Id, app_menu, "itemAtIndex:", .{pref}) orelse break :settings
+            else
+                send(Id, send(Id, objc_getClass("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{ nsString("Settings…"), sel_registerName("fire:"), nsString(",") });
+            send(void, item, "setTitle:", .{nsString("Settings…")});
+            send(void, item, "setAction:", .{sel_registerName("fire:")});
+            send(void, item, "setTag:", .{tag});
             send(void, item, "setTarget:", .{tgt});
-            // After "About <app>" and a separator, as macOS apps place it.
-            const at: i64 = @min(1, send(i64, app_menu, "numberOfItems", .{}));
-            send(void, app_menu, "insertItem:atIndex:", .{ send(Id, objc_getClass("NSMenuItem"), "separatorItem", .{}), at });
-            send(void, app_menu, "insertItem:atIndex:", .{ item, at + 1 });
+            if (pref < 0) {
+                // No placeholder: after "About <app>" and a separator, as macOS apps place it.
+                const at: i64 = @min(1, send(i64, app_menu, "numberOfItems", .{}));
+                send(void, app_menu, "insertItem:atIndex:", .{ send(Id, objc_getClass("NSMenuItem"), "separatorItem", .{}), at });
+                send(void, app_menu, "insertItem:atIndex:", .{ item, at + 1 });
+            }
         }
         for (menus) |m| {
             const holder = send(Id, objc_getClass("NSMenuItem"), "new", .{});
@@ -2172,11 +2310,11 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
     // costs a full rebuild+raster) so redraw storms can be attributed.
     if (g_frame_log) std.debug.print("[zigui] event 0x{x}\n", .{ev.type});
     const on_panel = g_panel_id != 0 and switch (ev.type) {
-        c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT => switch (ev.type) {
+        c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP, c.SDL_EVENT_TEXT_INPUT => switch (ev.type) {
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => ev.button.windowID == g_panel_id,
             c.SDL_EVENT_MOUSE_MOTION => ev.motion.windowID == g_panel_id,
             c.SDL_EVENT_MOUSE_WHEEL => ev.wheel.windowID == g_panel_id,
-            c.SDL_EVENT_KEY_DOWN => ev.key.windowID == g_panel_id,
+            c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP => ev.key.windowID == g_panel_id,
             else => ev.text.windowID == g_panel_id,
         },
         c.SDL_EVENT_WINDOW_FOCUS_LOST, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED, c.SDL_EVENT_WINDOW_MOUSE_LEAVE => ev.window.windowID == g_panel_id,
@@ -2190,14 +2328,15 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         else => {},
     }
     switch (ev.type) {
-        c.SDL_EVENT_QUIT => running.* = false,
+        // A quit handler may refuse (see `setQuitHandler`).
+        c.SDL_EVENT_QUIT => g_hooks.requestQuit(running),
         // Clicking anywhere else dismisses the popover, like a native panel.
         c.SDL_EVENT_WINDOW_FOCUS_LOST => if (on_panel) hidePanel() else if (g_focus_fn) |f| f(false),
         c.SDL_EVENT_WINDOW_FOCUS_GAINED => if (ev.window.windowID != g_panel_id) if (g_focus_fn) |f| f(true),
         // The close button: hide-to-tray when configured, else quit. (⌘Q still
         // sends SDL_EVENT_QUIT.)
         c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => if (on_panel) hidePanel() else if (g_hide_on_close) hideWindow() else {
-            running.* = false;
+            g_hooks.requestQuit(running);
         },
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
             const p = eventPoint(ev.button.x, ev.button.y);
@@ -2232,7 +2371,11 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         // Drag the mouse with the left button held to extend a text selection.
         c.SDL_EVENT_MOUSE_MOTION => {
             const mp = eventPoint(ev.motion.x, ev.motion.y);
-            if (on_panel) g_panel_hover = mp else g_hover_point = mp; // drives Modifiers.hover_fill highlights
+            if (on_panel) g_panel_hover = mp else {
+                // `onHover` callbacks fire on crossing a region's edge.
+                _ = zigui.dispatchHover(g_hover_regions.items, g_hover_point, mp);
+                g_hover_point = mp; // drives Modifiers.hover_fill highlights
+            }
             // Track the hovered context-menu item (the loop redraws after this
             // event, so the highlight follows the cursor).
             if (zigui.contextMenuOpen()) zigui.hoverContextMenu(h, mp);
@@ -2245,8 +2388,10 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         c.SDL_EVENT_WINDOW_MOUSE_LEAVE => if (on_panel) {
             g_panel_hover = null;
         } else {
+            _ = zigui.dispatchHover(g_hover_regions.items, g_hover_point, null);
             g_hover_point = null;
         },
+        c.SDL_EVENT_KEY_UP => if (!on_panel) g_hooks.keyUp(ev.key.key, @intCast(ev.key.mod)),
         c.SDL_EVENT_DROP_FILE => {
             if (g_drop_fn) |f| if (ev.drop.data != null) f(std.mem.span(ev.drop.data));
         },

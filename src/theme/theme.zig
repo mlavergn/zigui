@@ -224,8 +224,24 @@ pub const Surface = struct {
     pub fn stroke(s: Surface, rect: Rect, radius: f32, width: f32, c: Color) Allocator.Error!void {
         try s.canvas.strokeRoundedRect(rect, radius, width, c.multiplyAlpha(s.opacity));
     }
+    /// A left-to-right (horizontal) gradient filling `rect`.
+    pub fn horizontalGradient(s: Surface, rect: Rect, radius: f32, left: Color, right: Color) Allocator.Error!void {
+        try s.canvas.push(.{ .linear_gradient = .{
+            .rect = rect,
+            .radius = radius,
+            .start = .{ .x = rect.x, .y = rect.y },
+            .end = .{ .x = rect.maxX(), .y = rect.y },
+            .c0 = left.multiplyAlpha(s.opacity),
+            .c1 = right.multiplyAlpha(s.opacity),
+        } });
+    }
+    /// A hairline along the bottom edge of `rect`, in the separator color.
+    pub fn bottomHairline(s: Surface, rect: Rect) Allocator.Error!void {
+        const h = s.metrics.hairline;
+        try s.fill(.{ .x = rect.x, .y = rect.maxY() - h, .width = rect.width, .height = h }, 0, s.palette.separator);
+    }
     /// A top-to-bottom (vertical) gradient filling `rect`.
-    pub fn vGradient(s: Surface, rect: Rect, radius: f32, top: Color, bottom: Color) Allocator.Error!void {
+    pub fn verticalGradient(s: Surface, rect: Rect, radius: f32, top: Color, bottom: Color) Allocator.Error!void {
         try s.canvas.push(.{ .linear_gradient = .{
             .rect = rect,
             .radius = radius,
@@ -290,6 +306,14 @@ pub const Painter = struct {
     /// sidebars). Optional: themes without a glass identity fall back to a
     /// translucent `control_track` fill with a `control_border` ring.
     glassSurface: ?*const fn (s: Surface, rect: Rect, radius: f32) Allocator.Error!void = null,
+    /// Draw the background of an app-drawn title bar across `rect` (a window
+    /// with `Config.custom_titlebar`, off macOS). Optional: unset, the window
+    /// background with a hairline along the bottom. See `Theme.drawTitleBar`.
+    titleBar: ?*const fn (s: Surface, rect: Rect) Allocator.Error!void = null,
+    /// The color text and glyphs take on that title bar. Optional: unset,
+    /// `label`. Pure, so composed views read it at build time
+    /// (`Theme.titleBarForeground`).
+    titleBarForeground: ?*const fn (p: *const Palette) Color = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -335,6 +359,21 @@ pub const Theme = struct {
             .caption => self.typography.caption,
             .caption2 => self.typography.caption2,
         };
+    }
+
+    /// Draw an app-drawn title bar's background (`Painter.titleBar`, else the
+    /// window background with a hairline along the bottom).
+    pub fn drawTitleBar(self: *const Theme, s: Surface, rect: Rect) Allocator.Error!void {
+        if (self.painter.titleBar) |f| return f(s, rect);
+        try s.fill(rect, 0, s.palette.window_background);
+        try s.bottomHairline(rect);
+    }
+
+    /// The color text and glyphs take on an app-drawn title bar
+    /// (`Painter.titleBarForeground`, else `label`).
+    pub fn titleBarForeground(self: *const Theme) Color {
+        if (self.painter.titleBarForeground) |f| return f(&self.colors);
+        return self.colors.label;
     }
 };
 

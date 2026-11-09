@@ -29,7 +29,7 @@ seams each one uses.
 ## Build / test / run — and the gotchas
 
 ```sh
-zig build test --summary all                # 169 tests, headless. THIS is the inner loop.
+zig build test --summary all                # 244 tests, headless. THIS is the inner loop.
 zig build showcase edit                      # build the two examples (does NOT run them)
 zig build run-showcase                       # opens a window — blocks on the event loop
 make demo                                    # same, ReleaseFast (SDL3 fetched/built by Zig)
@@ -145,6 +145,11 @@ app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → prese
   `ctx.arena` (or `Pen.fmt` inside a `Drawing`).
 - **Scroll views cull**: views wholly outside the viewport (`Context.visible`)
   skip painting, hit regions included; a view presenting an overlay still paints.
+- **Clips cut input too**: scroll views and `.clipped()` trim the tap, hover
+  and scroll regions and passthrough frames their content added to the visible
+  rect (`clipInput`), so a row scrolled up under a toolbar can't take the
+  toolbar's taps or hold a popover open through them. Overlay regions are
+  appended after the tree paints, so they are never trimmed.
 
 ## Recipe: add a component
 
@@ -288,7 +293,7 @@ roles (`control_face`/`control_highlight`/`control_light`/`control_shadow`/
 The **look** is owned by a per-theme **`Painter`** — a small vtable
 (`button`/`field`/`segmentedTrack`/`segmentedSelection`/`switchTrack`) that draws
 only *chrome* into a `theme.Surface` (canvas + palette + metrics + scheme +
-opacity, with `fill`/`stroke`/`vGradient`/`lineSeg` helpers). **Painters depend
+opacity, with `fill`/`stroke`/`verticalGradient`/`lineSeg` helpers). **Painters depend
 only on the renderer + tokens, never on the view layer** — so the seam has no
 dependency cycle: the view layer keeps text/layout/hit-regions and calls
 `ctx.theme.painter.*` (via `ctx.surface(canvas)`) for decoration; `painter.button`
@@ -444,6 +449,21 @@ modal scrim correctly blocks taps to the content beneath. `Menu`/`ContextMenu` =
 a button/trigger toggling an app-owned `State(bool)` that drives a `.popover` of
 item buttons. (There is no `.menu` overlay style; menus use `.popover`.)
 
+`.popoverPassthrough()` (`Modifiers.popover_passthrough`) keeps a view's frame
+live while a popover is open: `paint` collects such frames into
+`Context.passthrough` (`render` supplies the list when the caller didn't), and
+`drawOverlay` cuts them out of a *popover's* dismiss region (`appendDismiss`
+splits the root around each hole). Sheets and alerts ignore it — they're modal.
+A menu bar's titles use it, so a click on another title switches menus.
+
+`.onHover(HoverCallback)` (SwiftUI's `.onHover`): `paint` appends a
+`HoverRegion{rect, callback, disabled}` to the optional `Context.hover_regions`
+sink (null = ignored), and `dispatchHover(regions, from, to)` fires leaves, then
+enters, for the regions the pointer crossed between two points (null = outside
+the window). It fires on movement only, skips disabled views, and ignores
+overlays. `app.zig` keeps the main window's list (`g_hover_regions`, arena-backed
+like the hit regions) and dispatches on `MOUSE_MOTION` and `WINDOW_MOUSE_LEAVE`.
+
 ### Accessibility — parallel a11y tree (`Context.a11y`; tree only)
 `A11yNode{rect, role, label, value}` with `A11yRole{static_text, button, switch_,
 slider, text_field, image, header}` (trailing `_` dodges the `switch` keyword).
@@ -587,10 +607,38 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
   `setKeyHandler(fn(key, mods) bool)` hook (mirrors `setBusyCheck`) gets first
   refusal on every key-down so an app can grab ⌘-shortcuts/clipboard; `examples/
   edit` uses it for ⌘S/O/N/F/A and ⌘C/X/V (SDL clipboard) and ⌘±/0 zoom.
+- **Key-ups and the quit question** go through `AppHooks` (`src/app_hooks.zig`,
+  pure and tested; `app.zig` keeps one in `g_hooks`). `setKeyUpHandler(fn(key,
+  mods) void)` sees every main-window key-up (an app tells an Alt tap from
+  Alt+Tab). `setQuitHandler(fn() bool)` is asked on `SDL_EVENT_QUIT` and on the
+  main window's close request; false keeps the loop running. `quit()` never
+  asks, and hide-on-close is not a quit. While a handler is set, every
+  `SDL_Init` in app.zig (`run`, `Tray.create`, `createStatusItem`, via
+  `beforeSdlInit`) sets `SDL_HINT_NO_SIGNAL_HANDLERS` first, so SIGINT/SIGTERM
+  still end the process (set the handler before whichever starts SDL). The
+  showcase's Overlays panel demos all four (`--passthrough` opens its
+  passthrough popover).
+- **Custom title bars** (off macOS): `Config.custom_titlebar` creates the window
+  `SDL_WINDOW_BORDERLESS` (SDL 3.4 keeps `WS_CAPTION`/`WS_THICKFRAME` on Windows
+  and zeroes the non-client area, so the DWM shadow, Windows 11 corners, Aero
+  Snap and maximize-to-work-area survive) and installs `bandHitTest`, which now
+  asks the pure `WindowHitArea.at` (`src/window_hit.zig`): resize edges
+  (`resize_edge`, 6 pt, none while maximized), then the `drag_band`'s empty
+  space; fullscreen, neither. Overlay dismiss regions are their own `HitAction.dismiss` (it acts as
+  `.toggle`), which the hit test skips, so the bar still drags under a menu or
+  a modal. `minimizeWindow`, `toggleMaximized`, `isMaximized` and
+  `requestClose` (hides with `hide_on_close`, else asks the quit handler) back
+  the app's window buttons. No Snap Layouts flyout: SDL's hit test has no `HTMAXBUTTON`. The bar's look
+  is the family's: `Painter.titleBar` (optional; default the window background
+  over a hairline) via `Theme.drawTitleBar`, and `Painter.titleBarForeground`
+  via `Theme.titleBarForeground` (pure, so build-time code reads it from
+  `buildTheme()`). `.modalPassthrough()` keeps a view live under a sheet's or
+  alert's scrim (`Context.modal_passthrough`), as `.popoverPassthrough()` does
+  for popovers. The showcase's Overlays panel has a "Custom title bar" card.
   `setFocus` is now exported so an app can focus the editor at launch.
 
 ### Added for the first apps built on it
-- `Drawing(T, ctx, fn)` + `Pen` (line/fill/vGradient/text/fmt): a view that
+- `Drawing(T, ctx, fn)` + `Pen` (line/fill/verticalGradient/text/fmt): a view that
   paints itself — charts and one-off graphics.
 - `.selectable()` on rich text: press-drag selection inside that one view,
   `selectedText()` for ⌘C (the app loop copies it), `textCursorAt` for the
@@ -610,7 +658,8 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
   content is then laid out in the reader's rect. Fills what it is offered. Shown
   in the showcase's Geometry panel (`showcase --screenshot out.bmp 9`).
 - `.clipped()` — cuts a view's content to its frame (rounded by its
-  `cornerRadius`), like SwiftUI's; ziggui's split views clip each pane with it.
+  `cornerRadius`), like SwiftUI's, taps and hover included; ziggui's split
+  views clip each pane with it.
 - `buildTheme()` — the whole `Theme` `setThemeTokens` last published, for
   composed constructors outside zigui (ziggui derives its extra tokens from it).
 - zigui is consumed only by `../ziggui`, which re-exports it beside its own

@@ -134,7 +134,15 @@ fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
     try s.stroke(rect, 0, 1, s.palette.control_border);
 }
 
+/// Windows 11's caption with the accent off: white in light, #202020 in dark,
+/// over a hairline.
+fn titleBar(s: Surface, rect: Rect) Err!void {
+    try s.fill(rect, 0, if (s.scheme == .dark) Color.fromRgb8(32, 32, 32) else Color.white);
+    try s.bottomHairline(rect);
+}
+
 pub const painter = theme.Painter{
+    .titleBar = titleBar,
     .button = button,
     .field = field,
     .segmentedTrack = segmentedTrack,
